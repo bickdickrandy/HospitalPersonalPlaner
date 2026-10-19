@@ -1,6 +1,6 @@
 # Klinik Dienstplan
 
-Eine lokale Desktop-Anwendung für die Planung von Krankenhaus-Schichten. Die Daten bleiben in einer SQLite-Datei im Ordner `data` neben der Anwendung. Dadurch lässt sich der gesamte Ordner auf einen USB-Stick kopieren.
+Lokale Desktop-App zur Krankenhaus-Personalplanung mit SQLite-Datenspeicherung.
 
 ## Starten
 
@@ -10,19 +10,29 @@ Python 3.10 oder neuer mit Tkinter:
 python main.py
 ```
 
+Beim ersten Start werden acht **fiktive Demo-Mitarbeitende** und ein Beispielplan für den aktuellen Monat angelegt. Die Demo-Namen sind Testdaten und können bearbeitet oder deaktiviert werden. Die Datenbank liegt lokal unter `data/dienstplan.db`.
+
+## Funktionen
+
+- Monatskalender mit einer Kalenderseite pro Monat
+- Baden-Württembergische Feiertage sowie Samstage und Sonntage leicht abgedunkelt; alle Tage bleiben planbar
+- Tagesansicht zum Bearbeiten der Zuordnung von Mitarbeitenden zu Schichten
+- Mitarbeitende mit Vertragsstunden, maximalen Arbeitstagen, Qualifikationen, Wünschen und einzelnen Abwesenheitstagen
+- Urlaubszeiträume eintragen und löschen; der automatische Entwurf berücksichtigt Urlaub
+- Schichtmodelle mit Arbeitszeiten, Stunden und täglicher Mindestbesetzung bearbeiten
+- Automatischen Monatsentwurf erstellen und als CSV exportieren
+- Lokale Speicherung ohne Cloudkonto
+
 ## Windows-EXE bauen
 
-Auf einem Windows-PC einmalig Python installieren und im Projektordner `build_windows.bat` starten. Das Skript erzeugt `dist\Klinik-Dienstplan\Klinik-Dienstplan.exe`. Den gesamten Ordner `dist\Klinik-Dienstplan` auf den USB-Stick kopieren; die Datenbank liegt im Unterordner `data`.
+Auf einem Windows-PC im Projektordner `build_windows.bat` starten. Das Skript erzeugt `dist\\Klinik-Dienstplan\\Klinik-Dienstplan.exe`. Den gesamten Ordner `dist\\Klinik-Dienstplan` auf einen USB-Stick kopieren; die Datenbank bleibt im Unterordner `data`.
 
-## Funktionen der ersten Version
+## Tests
 
-- Mitarbeitende mit Bereich/Qualifikation, Vertragsstunden, maximalen Arbeitstagen, Schicht-Eignung, Wünschen und Abwesenheitstagen verwalten
-- Schichtmodelle mit Zeiten, Stunden und Mindestbesetzung anlegen und ändern
-- Monatsplan automatisch erzeugen; Wochenendwünsche, Abwesenheit, Schicht-Eignung und einfache Ruhezeitregeln fließen in die Zuteilung ein
-- Einträge per Doppelklick ändern oder löschen
-- CSV-Export für den gewählten Monat
-- Lokale SQLite-Speicherung ohne Cloudkonto
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Hinweis
 
-Der automatische Plan ist ein Planungsvorschlag. Die Klinik muss Besetzung, Qualifikationen, Ruhezeiten, Tarif-/Arbeitszeitregeln und Betriebsvereinbarungen vor einer Freigabe prüfen. Für echte Dienstplanung sollten die Regeln mit den Vorgaben des Hauses abgestimmt und der Generator entsprechend erweitert werden.
+Der automatische Plan ist ein Vorschlag. Vor einer Freigabe müssen Besetzung, Qualifikationen, Ruhezeiten sowie die Arbeitszeit-, Tarif- und Hausregeln geprüft werden. Feiertagsnamen folgen der gesetzlichen Feiertagsliste Baden-Württembergs. Die Anwendung ist noch kein geprüfter Ersatz für ein klinisches Dienstplanungssystem.
