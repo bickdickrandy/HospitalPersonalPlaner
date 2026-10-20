@@ -1,4 +1,5 @@
 import os
+import random
 import tempfile
 import unittest
 from datetime import date
@@ -18,22 +19,21 @@ class CalendarRuleTests(unittest.TestCase):
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.old_db_path = main.DB_PATH
-        main.DB_PATH = os.path.join(self.temp.name, 'test.db')
-        self.store = main.Store()
+        self.path = os.path.join(self.temp.name, 'test.db')
+        self.store = main.Store(self.path)
 
     def tearDown(self):
         self.store.db.close()
-        main.DB_PATH = self.old_db_path
         self.temp.cleanup()
 
     def test_demo_staff_are_seeded_once(self):
         self.assertTrue(self.store.demo_seeded_now)
-        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM employees').fetchone()[0], 8)
-        second = main.Store()
+        count = len(main.DEMO_STAFF)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM employees').fetchone()[0], count)
+        second = main.Store(self.path)
         try:
             self.assertFalse(second.demo_seeded_now)
-            self.assertEqual(second.db.execute('SELECT COUNT(*) FROM employees').fetchone()[0], 8)
+            self.assertEqual(second.db.execute('SELECT COUNT(*) FROM employees').fetchone()[0], count)
         finally:
             second.db.close()
 
@@ -41,7 +41,7 @@ class SchedulerTests(unittest.TestCase):
         employee = self.store.all('SELECT id FROM employees ORDER BY id LIMIT 1')[0]['id']
         self.store.run('INSERT INTO leave_periods(employee_id,start_date,end_date) VALUES(?,?,?)',
                        (employee, '2026-10-10', '2026-10-12'))
-        missing = main.build_assignments(self.store, date(2026, 10, 1), clear_existing=True)
+        missing = main.build_assignments(self.store, date(2026, 10, 1), clear_existing=True, rng=random.Random(3))
         self.assertEqual(missing, 0)
         self.assertEqual(self.store.db.execute(
             'SELECT COUNT(*) FROM assignments WHERE employee_id=? AND day BETWEEN ? AND ?',

@@ -1,0 +1,3 @@
+# Laufzeit: keine Fremdpakete – nur Python 3.10+ mit Tkinter (Standardbibliothek).
+# Nur für den Windows-Build (build_windows.bat) benötigt:
+pyinstaller>=6.0
