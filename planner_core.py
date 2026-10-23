@@ -896,6 +896,14 @@ def evaluate_swap(ctx, kind, a_id, a_day, b_id, b_day=None):
     for side, check in pre:
         (opt.checks_a if side == 'a' else opt.checks_b).append(check)
     no_double = Check('Doppelte Schicht', 'ok', 'Keine zweite Schicht am selben Tag.')
+    for eid, iso, _old, new in opt.changes:
+        day = date.fromisoformat(iso)
+        fixed_sid = ctx.patterns.get((eid, day.weekday()))
+        if fixed_sid and new != fixed_sid:
+            check = Check('Feste Wochenschicht', 'block',
+                          f'{ctx.employees[eid].name}: die feste Wochenschicht '
+                          f'„{ctx.shifts[fixed_sid].name}“ am {fmt_day(day)} darf nicht entfernt oder getauscht werden.')
+            (opt.checks_a if eid == a_id else opt.checks_b).append(check)
     for eid, target in ((a_id, opt.checks_a), (b_id, opt.checks_b)):
         if not any(c.rule == 'Doppelte Schicht' for c in target):
             target.append(no_double)
@@ -1511,6 +1519,12 @@ def preview_day_changes(ctx, day, changes):
                       if c.status in ('block', 'warn')]
             if issues:
                 result[eid] = issues
+        else:
+            fixed_sid = ctx.patterns.get((eid, day.weekday()))
+            if fixed_sid:
+                result[eid] = [Check('Feste Wochenschicht', 'block',
+                                     f'{ctx.employees[eid].name}: die feste Wochenschicht '
+                                     f'„{ctx.shifts[fixed_sid].name}“ am {fmt_day(day)} darf nicht entfernt werden.')]
     pairs = {(day.isoformat(), s.id) for s in ctx.shift_list}
     cov = [c for c in ctx.coverage_checks(pairs, overlay) if c.status != 'ok']
     if cov:
