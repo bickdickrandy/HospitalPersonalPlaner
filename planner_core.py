@@ -30,7 +30,7 @@ MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August'
 WEEKDAYS = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
 WEEKDAYS_LONG = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag']
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_SETTINGS = {
     # Hausregeln mit konservativen Standardwerten. Sie sind in der App änderbar und
     # ausdrücklich KEINE Aussage über gesetzliche Konformität.
@@ -197,7 +197,24 @@ def _migrate_to_v4(db):
                ('hours_tolerance', DEFAULT_SETTINGS['hours_tolerance']))
 
 
-MIGRATIONS = {2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4}
+def _migrate_to_v5(db):
+    """Allgemeines Änderungsprotokoll für mehrstufiges Rückgängig/Wiederholen (idempotent).
+
+    state: 0 = rückgängig machbar, 1 = rückgängig gemacht (wiederholbar), 2 = verworfen,
+    3 = gesperrt (betroffene Person wurde gelöscht)."""
+    db.execute('''CREATE TABLE IF NOT EXISTS change_log(
+        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, description TEXT NOT NULL,
+        changes_json TEXT NOT NULL, extra_json TEXT NOT NULL DEFAULT '{}', state INTEGER NOT NULL DEFAULT 0)''')
+    has_swaps = db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='swap_log'").fetchone()[0]
+    if has_swaps and not db.execute('SELECT COUNT(*) FROM change_log').fetchone()[0]:
+        for row in db.execute('SELECT * FROM swap_log ORDER BY id').fetchall():
+            before, after = json.loads(row[3]), json.loads(row[4])
+            changes = [[b[0], b[1], b[2], a[2]] for b, a in zip(before, after)]
+            db.execute('INSERT INTO change_log(created_at,kind,description,changes_json,state) VALUES(?,?,?,?,?)',
+                       (row[1], 'swap', row[2], json.dumps(changes), 0 if row[5] == 0 else 2))
+
+
+MIGRATIONS = {2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
 
 DEMO_STAFF = [
     # Fiktive Kennungen statt Namen – eindeutig als Testdaten erkennbar.
@@ -311,7 +328,7 @@ class Store:
         if seeded:
             # Testurlaube im aktuellen und im Folgemonat, damit Urlaub sofort sichtbar ist.
             this_month = date.today().replace(day=1)
-            add_test_leaves(self, [this_month, add_months(this_month, 1)])
+            add_test_leaves(self, [this_month, add_months(this_month, 1)], log=False)
         return seeded
 
     def close(self):
@@ -321,6 +338,11 @@ class Store:
 # ---------------------------------------------------------------------------
 # Datenmodell für die Planung
 # ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=256)
+def _parse_hm(value):
+    return datetime.strptime(value, '%H:%M').time()
+
 
 @dataclass(frozen=True)
 class Shift:
@@ -342,8 +364,8 @@ class Shift:
         return self.end <= self.start or self.start >= '20:00'
 
     def interval(self, day):
-        begin = datetime.combine(day, datetime.strptime(self.start, '%H:%M').time())
-        finish = datetime.combine(day, datetime.strptime(self.end, '%H:%M').time())
+        begin = datetime.combine(day, _parse_hm(self.start))
+        finish = datetime.combine(day, _parse_hm(self.end))
         if finish <= begin:
             finish += timedelta(days=1)
         return begin, finish
@@ -868,33 +890,105 @@ def apply_swap(store, option):
                 raise StaleSwapError('Der Dienstplan wurde inzwischen geändert. Bitte Vorschläge neu laden.')
         for eid, iso, _old, new in fresh.changes:
             _write_assignment(store.db, eid, iso, new)
-        cur = store.db.execute(
-            'INSERT INTO swap_log(created_at,description,before_json,after_json) VALUES(?,?,?,?)',
-            (datetime.now().isoformat(timespec='seconds'), description,
-             json.dumps([[e, d, o] for e, d, o, _n in fresh.changes]),
-             json.dumps([[e, d, n] for e, d, _o, n in fresh.changes])))
+        return log_change(store.db, 'swap', 'Tausch: ' + description, fresh.changes)
+
+
+# ---------------------------------------------------------------------------
+# Änderungsprotokoll: mehrstufiges Rückgängig / Wiederholen
+# ---------------------------------------------------------------------------
+
+UNDO_LIMIT = 200  # ältere Schritte werden verworfen
+
+
+def log_change(db, kind, description, changes, extra=None):
+    """Protokolliert eine Planänderung als einen Rückgängig-Schritt (innerhalb der laufenden Transaktion).
+
+    changes: [(employee_id, iso_tag, alte_schicht|None, neue_schicht|None)]
+    extra: {'leaves_added': [Urlaubszeile], 'leaves_deleted': [Urlaubszeile]}"""
+    changes = [[e, d, o, n] for e, d, o, n in changes if o != n]
+    extra = {k: v for k, v in (extra or {}).items() if v}
+    if not changes and not extra:
+        return None
+    db.execute('UPDATE change_log SET state=2 WHERE state=1')  # neue Änderung verwirft „Wiederholen“
+    cur = db.execute('INSERT INTO change_log(created_at,kind,description,changes_json,extra_json) VALUES(?,?,?,?,?)',
+                     (datetime.now().isoformat(timespec='seconds'), kind, description, json.dumps(changes),
+                      json.dumps(extra)))
+    db.execute('DELETE FROM change_log WHERE id <= (SELECT id FROM change_log ORDER BY id DESC LIMIT 1 OFFSET ?)',
+               (UNDO_LIMIT,))
     return cur.lastrowid
 
 
-def last_undoable_swap(store):
-    return store.db.execute('SELECT * FROM swap_log WHERE undone=0 ORDER BY id DESC LIMIT 1').fetchone()
+def _leave_row(db, leave_id):
+    row = db.execute('SELECT id,employee_id,start_date,end_date,note FROM leave_periods WHERE id=?',
+                     (leave_id,)).fetchone()
+    return list(row) if row else None
 
 
-def undo_last_swap(store):
-    """Macht den letzten Tausch rückgängig, aber nur, wenn die Tage seitdem unverändert sind."""
-    row = last_undoable_swap(store)
+def _insert_leave_row(db, row):
+    if db.execute('SELECT 1 FROM employees WHERE id=?', (row[1],)).fetchone():
+        db.execute('INSERT OR IGNORE INTO leave_periods(id,employee_id,start_date,end_date,note) VALUES(?,?,?,?,?)',
+                   tuple(row))
+
+
+def undo_info(store):
+    """(Beschreibung nächstes Rückgängig, Anzahl, Beschreibung nächstes Wiederholen, Anzahl)."""
+    undo = store.db.execute('SELECT description FROM change_log WHERE state=0 ORDER BY id DESC LIMIT 1').fetchone()
+    redo = store.db.execute('SELECT description FROM change_log WHERE state=1 ORDER BY id ASC LIMIT 1').fetchone()
+    n_undo = store.db.execute('SELECT COUNT(*) FROM change_log WHERE state=0').fetchone()[0]
+    n_redo = store.db.execute('SELECT COUNT(*) FROM change_log WHERE state=1').fetchone()[0]
+    return (undo[0] if undo else None), n_undo, (redo[0] if redo else None), n_redo
+
+
+def _step(store, undo):
+    if undo:
+        row = store.db.execute('SELECT * FROM change_log WHERE state=0 ORDER BY id DESC LIMIT 1').fetchone()
+    else:
+        row = store.db.execute('SELECT * FROM change_log WHERE state=1 ORDER BY id ASC LIMIT 1').fetchone()
     if not row:
-        raise StaleSwapError('Es gibt keinen Tausch, der rückgängig gemacht werden kann.')
-    before, after = json.loads(row['before_json']), json.loads(row['after_json'])
+        raise StaleSwapError('Es gibt keinen Schritt, der ' + ('rückgängig gemacht' if undo else 'wiederholt') +
+                             ' werden kann.')
+    changes = json.loads(row['changes_json'])
+    extra = json.loads(row['extra_json'] or '{}')
+    add_key, del_key = ('leaves_added', 'leaves_deleted') if undo else ('leaves_deleted', 'leaves_added')
+    existing = {r[0] for r in store.db.execute('SELECT id FROM employees')}
     with store.db:
-        for eid, iso, sid in after:
-            if _current_sid(store.db, eid, iso) != sid:
-                raise StaleSwapError('Die betroffenen Tage wurden nach dem Tausch geändert. '
-                                     'Rückgängig machen ist daher nicht sicher möglich – bitte manuell prüfen.')
-        for eid, iso, sid in before:
-            _write_assignment(store.db, eid, iso, sid)
-        store.db.execute('UPDATE swap_log SET undone=1 WHERE id=?', (row['id'],))
+        # Sicherheitsprüfung: Nur wenn die betroffenen Einträge noch genau so aussehen wie nach (bzw. vor)
+        # diesem Schritt, wird zurückgesetzt – spätere Änderungen werden nie überschrieben.
+        for eid, iso, old, new in changes:
+            expected = new if undo else old
+            if eid in existing and _current_sid(store.db, eid, iso) != expected:
+                raise StaleSwapError(f'„{row["description"]}“ kann nicht ' +
+                                     ('rückgängig gemacht' if undo else 'wiederholt') +
+                                     ' werden, weil die betroffenen Tage danach anders geändert wurden '
+                                     '(z. B. über ein gelöschtes Schichtmodell). Bitte manuell prüfen.')
+        for leave in extra.get(add_key, []):
+            store.db.execute('DELETE FROM leave_periods WHERE id=?', (leave[0],))
+        for leave in extra.get(del_key, []):
+            _insert_leave_row(store.db, leave)
+        for eid, iso, old, new in (reversed(changes) if undo else changes):
+            if eid in existing:
+                _write_assignment(store.db, eid, iso, old if undo else new)
+        store.db.execute('UPDATE change_log SET state=? WHERE id=?', (1 if undo else 0, row['id']))
     return row['description']
+
+
+def undo_last_change(store):
+    """Macht den jüngsten Schritt rückgängig (mehrfach aufrufbar = mehrere Schritte)."""
+    return _step(store, True)
+
+
+def redo_next_change(store):
+    """Wiederholt den zuletzt rückgängig gemachten Schritt."""
+    return _step(store, False)
+
+
+def last_undoable_change(store):
+    return store.db.execute('SELECT * FROM change_log WHERE state=0 ORDER BY id DESC LIMIT 1').fetchone()
+
+
+# Kompatibilität mit früheren Funktionsnamen
+last_undoable_swap = last_undoable_change
+undo_last_swap = undo_last_change
 
 
 # ---------------------------------------------------------------------------
@@ -936,25 +1030,70 @@ def _fair_shares(ctx, total, pool):
 def generate_month(store, month, clear_existing=False, rng=None, fill_hours=True, attempts=6):
     """Erstellt mehrere Entwürfe mit unterschiedlicher Zufallsreihenfolge und speichert den besten
     (wenigste offene Plätze, dann geringste Abweichung von den Soll-Stunden). Siehe `_draft_month`."""
+    plan = compute_month_plan(store, month, clear_existing, rng, fill_hours, attempts)
+    return save_month_plan(store, month, plan, clear_existing)
+
+
+def compute_month_plan(store, month, clear_existing=False, rng=None, fill_hours=True, attempts=6):
+    """Rechnet den besten Entwurf, ohne zu speichern. `store` darf auch ein ReadStore sein
+    (eigene Verbindung), damit die Berechnung in einem Hintergrund-Thread laufen kann."""
     rng = rng or random.Random()
     best = None
     for _ in range(max(1, attempts)):
         draft = _draft_month(store, month, clear_existing, random.Random(rng.random()), fill_hours)
         if draft is None:
-            return GenerationResult()
+            return None
         if best is None or draft[0] < best[0]:
             best = draft
         if best[0][:3] == (0, 0, 0):
             break
-    _score, inserts, result = best
+    return best[1], best[2]
+
+
+def save_month_plan(store, month, plan, clear_existing=False):
+    """Speichert einen mit compute_month_plan berechneten Entwurf (als ein Rückgängig-Schritt)."""
+    if plan is None:
+        return GenerationResult()
+    inserts, result = plan
     start, end = month_bounds(month)
+    lo, hi = start.isoformat(), end.isoformat()
     with store.db:
+        before = {(r[0], r[1]): r[2] for r in store.db.execute(
+            'SELECT employee_id, day, shift_id FROM assignments WHERE day BETWEEN ? AND ?', (lo, hi))}
         if clear_existing:
-            store.db.execute('DELETE FROM assignments WHERE day BETWEEN ? AND ?', (start.isoformat(), end.isoformat()))
+            store.db.execute('DELETE FROM assignments WHERE day BETWEEN ? AND ?', (lo, hi))
         store.db.executemany('INSERT INTO assignments(day,employee_id,shift_id) VALUES(?,?,?) '
                              'ON CONFLICT(day,employee_id) DO UPDATE SET shift_id=excluded.shift_id', inserts)
+        after = {(r[0], r[1]): r[2] for r in store.db.execute(
+            'SELECT employee_id, day, shift_id FROM assignments WHERE day BETWEEN ? AND ?', (lo, hi))}
+        changes = [(eid, ds, before.get((eid, ds)), after.get((eid, ds)))
+                   for eid, ds in sorted(set(before) | set(after)) if before.get((eid, ds)) != after.get((eid, ds))]
+        label = 'neu geplant' if clear_existing else 'offene Plätze gefüllt'
+        log_change(store.db, 'generate', f'Monat {MONTHS[start.month - 1]} {start.year} {label} '
+                                         f'({len(changes)} Änderungen)', changes)
     result.filled = len(inserts)
     return result
+
+
+class ReadStore:
+    """Nur-Lese-Zugriff mit eigener Verbindung (z. B. für Berechnungen im Hintergrund-Thread)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+
+    def all(self, sql, args=()):
+        return self.db.execute(sql, args).fetchall()
+
+    def setting(self, key, default=None):
+        row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        if row:
+            return row[0]
+        return DEFAULT_SETTINGS.get(key, default)
+
+    def close(self):
+        self.db.close()
 
 
 def _draft_month(store, month, clear_existing, rng, fill_hours):
@@ -1167,18 +1306,28 @@ def plan_test_leaves(store, months):
     return plans
 
 
-def add_test_leaves(store, months):
-    """Legt geplante Testurlaube an. Rückgabe: (angelegte Urlaube, entfernte Dienste)."""
+def add_test_leaves(store, months, log=True):
+    """Legt geplante Testurlaube an (ein Rückgängig-Schritt). Rückgabe: (angelegte Urlaube, entfernte Dienste)."""
     plans = plan_test_leaves(store, months)
-    removed = 0
-    for eid, _name, begin, finish in plans:
-        removed += add_leave(store, eid, begin, finish, TEST_LEAVE_NOTE)
-    return plans, removed
+    leaves, removed = [], []
+    with store.db:
+        for eid, _name, begin, finish in plans:
+            leave, gone = _add_leave_rows(store.db, eid, begin, finish, TEST_LEAVE_NOTE, True)
+            leaves.append(leave)
+            removed += gone
+        if log:
+            log_change(store.db, 'test_leave', f'{len(leaves)} Testurlaube angelegt', removed,
+                       {'leaves_added': leaves})
+    return plans, len(removed)
 
 
 def remove_test_leaves(store):
     with store.db:
-        return store.db.execute('DELETE FROM leave_periods WHERE note=?', (TEST_LEAVE_NOTE,)).rowcount
+        rows = [list(r) for r in store.db.execute(
+            'SELECT id,employee_id,start_date,end_date,note FROM leave_periods WHERE note=?', (TEST_LEAVE_NOTE,))]
+        store.db.execute('DELETE FROM leave_periods WHERE note=?', (TEST_LEAVE_NOTE,))
+        log_change(store.db, 'test_leave_delete', f'{len(rows)} Testurlaube entfernt', [], {'leaves_deleted': rows})
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1240,9 +1389,12 @@ def preview_day_changes(ctx, day, changes):
 
 
 def apply_day_changes(store, day, changes):
+    iso = day.isoformat()
     with store.db:
+        logged = [(eid, iso, _current_sid(store.db, eid, iso), sid) for eid, sid in changes.items()]
         for eid, sid in changes.items():
-            _write_assignment(store.db, eid, day.isoformat(), sid)
+            _write_assignment(store.db, eid, iso, sid)
+        log_change(store.db, 'day', f'Tagesplanung {day:%d.%m.%Y} ({len(logged)} Änderung(en))', logged)
 
 
 def assignments_in_range(store, eid, first, last):
@@ -1256,21 +1408,83 @@ def overlapping_leave(store, eid, first, last):
                      (eid, last.isoformat(), first.isoformat()))
 
 
-def add_leave(store, eid, first, last, note='', remove_assignments=True):
+def _add_leave_rows(db, eid, first, last, note, remove_assignments):
+    if last < first:
+        raise ValueError('Das Ende darf nicht vor dem Beginn liegen.')
+    cur = db.execute('INSERT INTO leave_periods(employee_id,start_date,end_date,note) VALUES(?,?,?,?)',
+                     (eid, first.isoformat(), last.isoformat(), note))
+    removed = []
+    if remove_assignments:
+        removed = [(eid, r[0], r[1], None) for r in db.execute(
+            'SELECT day, shift_id FROM assignments WHERE employee_id=? AND day BETWEEN ? AND ?',
+            (eid, first.isoformat(), last.isoformat()))]
+        db.execute('DELETE FROM assignments WHERE employee_id=? AND day BETWEEN ? AND ?',
+                   (eid, first.isoformat(), last.isoformat()))
+    return _leave_row(db, cur.lastrowid), removed
+
+
+def _employee_name(db, eid):
+    row = db.execute('SELECT name FROM employees WHERE id=?', (eid,)).fetchone()
+    return row[0] if row else f'ID {eid}'
+
+
+def add_leave(store, eid, first, last, note='', remove_assignments=True, log=True):
     if last < first:
         raise ValueError('Das Ende darf nicht vor dem Beginn liegen.')
     with store.db:
-        store.db.execute('INSERT INTO leave_periods(employee_id,start_date,end_date,note) VALUES(?,?,?,?)',
-                         (eid, first.isoformat(), last.isoformat(), note))
-        removed = 0
-        if remove_assignments:
-            removed = store.db.execute('DELETE FROM assignments WHERE employee_id=? AND day BETWEEN ? AND ?',
-                                       (eid, first.isoformat(), last.isoformat())).rowcount
-    return removed
+        leave, removed = _add_leave_rows(store.db, eid, first, last, note, remove_assignments)
+        if log:
+            log_change(store.db, 'leave', f'Urlaub {_employee_name(store.db, eid)} {first:%d.%m.}–{last:%d.%m.%Y}',
+                       removed, {'leaves_added': [leave]})
+    return len(removed)
 
 
 def delete_leave(store, leave_id):
-    store.run('DELETE FROM leave_periods WHERE id=?', (leave_id,))
+    with store.db:
+        leave = _leave_row(store.db, leave_id)
+        if not leave:
+            return
+        store.db.execute('DELETE FROM leave_periods WHERE id=?', (leave_id,))
+        log_change(store.db, 'leave_delete', f'Urlaub entfernt: {_employee_name(store.db, leave[1])} '
+                   f'{date.fromisoformat(leave[2]):%d.%m.}–{date.fromisoformat(leave[3]):%d.%m.%Y}', [],
+                   {'leaves_deleted': [leave]})
+
+
+def employee_delete_impact(store, eid, today=None):
+    """Was beim Löschen einer Person mit entfernt würde (nur lesen, nichts ändern)."""
+    today = (today or date.today()).isoformat()
+    one = lambda sql: store.db.execute(sql, (eid,) if sql.count('?') == 1 else (eid, today)).fetchone()[0]
+    return {
+        'assignments': one('SELECT COUNT(*) FROM assignments WHERE employee_id=?'),
+        'future': one('SELECT COUNT(*) FROM assignments WHERE employee_id=? AND day>=?'),
+        'past': one('SELECT COUNT(*) FROM assignments WHERE employee_id=? AND day<?'),
+        'leave': one('SELECT COUNT(*) FROM leave_periods WHERE employee_id=?'),
+    }
+
+
+def delete_employee(store, eid):
+    """Löscht eine Person endgültig samt Diensten, Urlauben und Schichteignung.
+
+    Vorher wird automatisch eine Sicherung der Datenbank in data/backups angelegt. Tausche aus dem
+    Protokoll, an denen die Person beteiligt war, können danach nicht mehr rückgängig gemacht werden.
+    Rückgabe: (Name, Pfad der Sicherung)."""
+    row = store.db.execute('SELECT name FROM employees WHERE id=?', (eid,)).fetchone()
+    if not row:
+        raise ValueError('Diese Person existiert nicht (mehr).')
+    backup = store._backup('vor_loeschen')
+    with store.db:
+        for log in store.all('SELECT id,changes_json,extra_json FROM change_log WHERE state IN (0,1)'):
+            extra = json.loads(log['extra_json'] or '{}')
+            involved = any(entry[0] == eid for entry in json.loads(log['changes_json'])) or any(
+                leave[1] == eid for key in ('leaves_added', 'leaves_deleted') for leave in extra.get(key, []))
+            if involved:  # diese Schritte lassen sich ohne die Person nicht mehr sauber zurücksetzen
+                store.db.execute('UPDATE change_log SET state=3 WHERE id=?', (log['id'],))
+        # Explizit statt nur über ON DELETE CASCADE, damit auch ältere Datenbanken sauber bleiben.
+        store.db.execute('DELETE FROM assignments WHERE employee_id=?', (eid,))
+        store.db.execute('DELETE FROM leave_periods WHERE employee_id=?', (eid,))
+        store.db.execute('DELETE FROM eligibility WHERE employee_id=?', (eid,))
+        store.db.execute('DELETE FROM employees WHERE id=?', (eid,))
+    return row[0], backup
 
 
 def export_csv(store, month, path):

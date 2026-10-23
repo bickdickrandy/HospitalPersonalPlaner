@@ -544,11 +544,126 @@ class TestLeaveTests(TempStoreCase):
         db.close()
         store = pc.Store(path)
         try:
-            self.assertEqual(store.schema_version(), 4)
+            self.assertEqual(store.schema_version(), pc.SCHEMA_VERSION)
             self.assertEqual(store.all('SELECT max_staff FROM shifts')[0][0], 4)
             self.assertEqual(store.setting('hours_tolerance'), '4')
         finally:
             store.close()
+
+
+class DeleteEmployeeTests(TempStoreCase):
+    def test_delete_removes_person_data_and_creates_backup(self):
+        s = self.blank()
+        a, b = self.person('Person A'), self.person('Person B')
+        self.assign(a, date(2020, 1, 6), s['früh'])        # Vergangenheit
+        self.assign(a, date(2099, 1, 6), s['früh'])        # Zukunft
+        self.assign(b, date(2099, 1, 6), s['spät'])
+        pc.add_leave(self.store, a, date(2099, 2, 1), date(2099, 2, 3))
+        impact = pc.employee_delete_impact(self.store, a)
+        self.assertEqual((impact['assignments'], impact['past'], impact['future'], impact['leave']), (2, 1, 1, 1))
+        name, backup = pc.delete_employee(self.store, a)
+        self.assertEqual(name, 'Person A')
+        self.assertTrue(os.path.exists(backup))
+        for table in ('employees WHERE id=?', 'assignments WHERE employee_id=?', 'leave_periods WHERE employee_id=?',
+                      'eligibility WHERE employee_id=?'):
+            self.assertEqual(self.store.db.execute(f'SELECT COUNT(*) FROM {table}', (a,)).fetchone()[0], 0)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM assignments WHERE employee_id=?',
+                                               (b,)).fetchone()[0], 1)  # andere bleiben unberührt
+        backup_db = sqlite3.connect(backup)
+        self.assertEqual(backup_db.execute('SELECT COUNT(*) FROM employees WHERE id=?', (a,)).fetchone()[0], 1)
+        backup_db.close()
+        with self.assertRaises(ValueError):
+            pc.delete_employee(self.store, a)
+
+    def test_swap_with_deleted_person_is_no_longer_undoable(self):
+        a, b = self.person('Person A'), self.person('Person B')
+        s = {r['name'][:4].lower(): r['id'] for r in self.store.all('SELECT id,name FROM shifts')}
+        day = date(2026, 10, 14)
+        self.assign(a, day, s['früh'])
+        self.assign(b, day, s['spät'])
+        opt = pc.swap_between(self.ctx(), a, day, b, day)
+        pc.apply_swap(self.store, opt)
+        pc.delete_employee(self.store, b)
+        self.assertIsNone(pc.last_undoable_swap(self.store))
+
+
+class UndoRedoTests(TempStoreCase):
+    """Mehrstufiges Rückgängig/Wiederholen über alle Arten von Planänderungen."""
+
+    def snapshot(self):
+        return (sorted(tuple(r) for r in self.store.all('SELECT day,employee_id,shift_id FROM assignments')),
+                sorted(tuple(r) for r in self.store.all('SELECT employee_id,start_date,end_date,note FROM leave_periods')))
+
+    def test_multi_step_undo_and_redo_across_actions(self):
+        s = self.blank()
+        a, b, c = self.person('Person A'), self.person('Person B'), self.person('Person C')
+        day = date(2026, 10, 14)
+        self.assign(a, day, s['früh'])
+        self.assign(b, day, s['spät'])
+        states = [self.snapshot()]
+        pc.apply_swap(self.store, pc.swap_between(self.ctx(), a, day, b, day))                     # 1 Tausch
+        states.append(self.snapshot())
+        pc.apply_day_changes(self.store, day, {c: s['nach']})                                    # 2 Tagesplanung
+        states.append(self.snapshot())
+        pc.add_leave(self.store, a, day, day + timedelta(days=1))                                 # 3 Urlaub (entfernt Dienst)
+        states.append(self.snapshot())
+        pc.generate_month(self.store, date(2026, 10, 1), rng=random.Random(1), attempts=1)       # 4 Monat planen
+        states.append(self.snapshot())
+        self.assertEqual(pc.undo_info(self.store)[1], 4)
+        for expected in reversed(states[:-1]):                                                    # 4× zurück
+            pc.undo_last_change(self.store)
+            self.assertEqual(self.snapshot(), expected)
+        with self.assertRaises(pc.StaleSwapError):
+            pc.undo_last_change(self.store)
+        for expected in states[1:]:                                                               # 4× vor
+            pc.redo_next_change(self.store)
+            self.assertEqual(self.snapshot(), expected)
+        self.assertEqual(pc.undo_info(self.store)[3], 0)
+
+    def test_new_change_discards_redo(self):
+        s = self.blank()
+        a = self.person('Person A')
+        pc.apply_day_changes(self.store, date(2026, 10, 5), {a: s['früh']})
+        pc.undo_last_change(self.store)
+        self.assertEqual(pc.undo_info(self.store)[3], 1)
+        pc.apply_day_changes(self.store, date(2026, 10, 6), {a: s['spät']})
+        self.assertEqual(pc.undo_info(self.store)[3], 0)
+        with self.assertRaises(pc.StaleSwapError):
+            pc.redo_next_change(self.store)
+
+    def test_undo_refuses_when_rows_changed_outside_log(self):
+        s = self.blank()
+        a = self.person('Person A')
+        pc.apply_day_changes(self.store, date(2026, 10, 5), {a: s['früh']})
+        self.store.run('UPDATE assignments SET shift_id=? WHERE employee_id=?', (s['spät'], a))  # nicht protokolliert
+        with self.assertRaises(pc.StaleSwapError):
+            pc.undo_last_change(self.store)
+        self.assertEqual(self.ctx().shift_of(a, date(2026, 10, 5)), s['spät'])  # nichts überschrieben
+
+    def test_leave_delete_and_test_leaves_are_undoable(self):
+        s = self.blank()
+        demo = self.person('Demo Person')
+        self.store.run('UPDATE employees SET is_demo=1 WHERE id=?', (demo,))
+        before = self.snapshot()
+        pc.add_test_leaves(self.store, [date(2026, 10, 1)])
+        pc.remove_test_leaves(self.store)
+        self.assertEqual(self.snapshot(), before)
+        pc.undo_last_change(self.store)     # Testurlaube wieder da
+        self.assertEqual(len(self.snapshot()[1]), 1)
+        pc.undo_last_change(self.store)     # Testurlaube wieder weg
+        self.assertEqual(self.snapshot(), before)
+        pc.add_leave(self.store, demo, date(2026, 11, 2), date(2026, 11, 3))
+        leave_id = self.store.all('SELECT id FROM leave_periods')[0][0]
+        pc.delete_leave(self.store, leave_id)
+        pc.undo_last_change(self.store)
+        self.assertEqual(len(self.snapshot()[1]), 1)
+
+    def test_undo_history_is_limited(self):
+        s = self.blank()
+        a = self.person('Person A')
+        for i in range(pc.UNDO_LIMIT + 15):
+            pc.apply_day_changes(self.store, date(2026, 1, 1) + timedelta(days=i), {a: s['früh']})
+        self.assertLessEqual(self.store.db.execute('SELECT COUNT(*) FROM change_log').fetchone()[0], pc.UNDO_LIMIT + 1)
 
 
 if __name__ == '__main__':

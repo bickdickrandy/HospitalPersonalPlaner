@@ -2,6 +2,7 @@
 import math
 import os
 import re
+import threading
 import time
 import tkinter as tk
 from collections import defaultdict
@@ -49,7 +50,8 @@ class CalendarView(tk.Frame):
         self.canvas.configure(yscrollcommand=self.bar.set)
         self.canvas.pack(side='left', fill='both', expand=True)
         self.bar.pack(side='right', fill='y')
-        self.items, self.key_cell, self.chip_rects = {}, {}, {}
+        self.items, self.key_cell, self.chip_rects, self.chip_items = {}, {}, {}, {}
+        self._measure = {}
         self.hover_key, self.hover_cell = None, None
         self._job = None
         self._width = 0
@@ -75,13 +77,26 @@ class CalendarView(tk.Frame):
             self.after_cancel(self._job)
         self._job = self.after(60, self.render)
 
+    def measure(self, font, text):
+        """Textbreite mit Zwischenspeicher – font.measure ist in Tk vergleichsweise teuer."""
+        key = (id(font), text)
+        value = self._measure.get(key)
+        if value is None:
+            value = self._measure[key] = font.measure(text)
+        return value
+
     def _fit(self, text, font, width):
-        if font.measure(text) <= width:
-            return text
-        original = text
-        while text and font.measure(text + '…') > width:
-            text = text[:-1]
-        return text + '…' if len(text) > 1 else original[:2]
+        key = ('fit', id(font), text, int(width))
+        if key in self._measure:
+            return self._measure[key]
+        result = text
+        if self.measure(font, text) > width:
+            cut = text
+            while cut and self.measure(font, cut + '…') > width:
+                cut = cut[:-1]
+            result = cut + '…' if len(cut) > 1 else text[:2]
+        self._measure[key] = result
+        return result
 
     # -- Layout ------------------------------------------------------------
     @property
@@ -110,7 +125,7 @@ class CalendarView(tk.Frame):
             return
         self.app.tip.hide()
         c.delete('all')
-        self.items.clear(); self.key_cell.clear(); self.chip_rects.clear()
+        self.items.clear(); self.key_cell.clear(); self.chip_rects.clear(); self.chip_items.clear()
         self.hover_key = self.hover_cell = None
         W = max(380, c.winfo_width())
         pad, gap = 8, 6
@@ -212,16 +227,16 @@ class CalendarView(tk.Frame):
             count_color = C.DANGER if under else (C.ACCENT_SOFT if have > need else (C.OK if need else C.DIM))
             if under:
                 count = '! ' + count
-            count_w = self.f_title.measure(count)
+            count_w = self.measure(self.f_title, count)
             c.create_text(cx2 - 7, cy + 11, anchor='e', text=count, font=F(8, 'bold'), fill=count_color,
                           tags=(skey, cell_tag))
             title_space = (cx2 - 7 - count_w - 6) - (cx1 + 10)
             title = self._fit(s.short, self.f_title, title_space)
             c.create_text(cx1 + 10, cy + 11, anchor='w', text=title, font=F(8, 'bold'), fill=C.TEXT,
                           tags=(skey, cell_tag))
-            time_x = cx1 + 10 + self.f_title.measure(title) + 5
+            time_x = cx1 + 10 + self.measure(self.f_title, title) + 5
             time_text = compact_time(s)
-            if title == s.short and time_x + self.f_small.measure(time_text) < cx2 - 7 - count_w - 4:
+            if title == s.short and time_x + self.measure(self.f_small, time_text) < cx2 - 7 - count_w - 4:
                 c.create_text(time_x, cy + 11, anchor='w', text=time_text, font=F(7), fill=C.DIM,
                               tags=(skey, cell_tag))
             for k, eid in enumerate(eids):
@@ -262,7 +277,7 @@ class CalendarView(tk.Frame):
                 ly += 20
             return
         label = 'Urlaub' if any(k == 'leave' for _e, k in absent) else 'Abw.'
-        lw = self.f_small.measure(label) + 6
+        lw = self.measure(self.f_small, label) + 6
         c.create_text(cx1 + 2, cy + 10, anchor='w', text=label, font=F(7, 'bold'),
                       fill=C.LEAVE if label == 'Urlaub' else C.WARN, tags=(key, cell_tag))
         lx = cx1 + 2 + lw
@@ -281,18 +296,10 @@ class CalendarView(tk.Frame):
                           tags=(lkey, cell_tag))
             lx += 27
 
-    def _draw_chip(self, eid, day, shift, x, y, color, cell_tag, cell_rect):
-        app, c, ctx = self.app, self.canvas, self.app.ctx
-        emp = ctx.employees[eid]
-        ds = day.isoformat()
-        key = f'c{eid}_{ds}'
-        self.items[key] = ('chip', day, shift.id, eid)
-        self.key_cell[key] = cell_rect
-        w, h = self.chip_w, self.chip_h
-        r = h / 2
-        fill = blend(color, C.CARD, .62)
-        text_color = C.TEXT
-        outline, width = blend(color, C.CARD, .3), 1
+    def _chip_style(self, eid, ds, color):
+        """Farben eines Namenschips abhängig von Filter, Auswahl, Tauschpartnern und Vorschau."""
+        app, emp = self.app, self.app.ctx.employees[eid]
+        fill, text_color, outline, width, ring = blend(color, C.CARD, .62), C.TEXT, blend(color, C.CARD, .3), 1, None
         if (app.role_filter and emp.role != app.role_filter) or (
                 app.selected and app.selected[0] != eid and (eid, ds) not in app.highlights):
             fill, text_color, outline = blend(C.CARD, C.BG, .35), C.DIM, C.BORDER_SOFT
@@ -303,30 +310,77 @@ class CalendarView(tk.Frame):
                 fill, text_color, outline, width = blend(C.DANGER, C.CARD, .55), '#ffffff', C.DANGER, 2
             else:
                 fill, text_color, outline, width = C.ACCENT_SOFT, '#160b33', C.GLOW, 2
-            round_rect(c, x - 3, y - 3, x + w + 3, y + h + 3, r + 3, fill='', outline=blend(outline, C.CARD, .4),
-                       width=2, tags=(key, cell_tag))
+            ring = 'preview'
         if app.selected == (eid, ds):
+            fill, text_color, outline, width, ring = C.ACCENT, '#ffffff', C.GLOW, 2, 'selected'
+        return fill, text_color, outline, width, ring
+
+    def _draw_rings(self, key, ring, outline, x, y, w, h, cell_tag):
+        c, r = self.canvas, h / 2
+        if ring == 'preview':
+            round_rect(c, x - 3, y - 3, x + w + 3, y + h + 3, r + 3, fill='', outline=blend(outline, C.CARD, .4),
+                       width=2, tags=(key, cell_tag, 'ring'))
+        elif ring == 'selected':
             for grow, t in ((4, .7), (2, .35)):
                 round_rect(c, x - grow, y - grow, x + w + grow, y + h + grow, r + grow, fill='',
-                           outline=blend(C.ACCENT, C.CARD, t), width=2, tags=(key, cell_tag))
-            fill, text_color, outline, width = C.ACCENT, '#ffffff', C.GLOW, 2
-        rect = round_rect(c, x, y, x + w, y + h, r, fill=fill, outline=outline, width=width,
+                           outline=blend(C.ACCENT, C.CARD, t), width=2, tags=(key, cell_tag, 'ring'))
+
+    def _draw_chip(self, eid, day, shift, x, y, color, cell_tag, cell_rect):
+        c, ctx = self.canvas, self.app.ctx
+        emp = ctx.employees[eid]
+        ds = day.isoformat()
+        key = f'c{eid}_{ds}'
+        self.items[key] = ('chip', day, shift.id, eid)
+        self.key_cell[key] = cell_rect
+        w, h = self.chip_w, self.chip_h
+        fill, text_color, outline, width, ring = self._chip_style(eid, ds, color)
+        self._draw_rings(key, ring, outline, x, y, w, h, cell_tag)
+        rect = round_rect(c, x, y, x + w, y + h, h / 2, fill=fill, outline=outline, width=width,
                           tags=(key, 'chip', cell_tag))
         self.chip_rects[key] = (rect, outline, width)
         label_text = ctx.labels.get(eid, '?')
+        texts, badge = [], None
         if self.week_mode:
             # Initialen-Badge + voller Name
-            c.create_oval(x + 3, y + 3, x + h - 3, y + h - 3, fill=blend(text_color, fill, .78), outline='',
-                          tags=(key, 'chip', cell_tag))
-            c.create_text(x + h / 2, y + h / 2, text=label_text[:2], font=F(6, 'bold'), fill=text_color,
-                          tags=(key, 'chip', cell_tag))
+            badge = c.create_oval(x + 3, y + 3, x + h - 3, y + h - 3, fill=blend(text_color, fill, .78), outline='',
+                                  tags=(key, 'chip', cell_tag))
+            texts.append(c.create_text(x + h / 2, y + h / 2, text=label_text[:2], font=F(6, 'bold'), fill=text_color,
+                                       tags=(key, 'chip', cell_tag)))
             short_name = re.sub(r'^(Demo|Test)\s+', '', emp.name)  # Kennzeichnung steht im Tooltip
             name = self._fit(short_name, self.f_name, w - h - 10)
-            c.create_text(x + h + 3, y + h / 2, anchor='w', text=name, font=F(9, 'bold'), fill=text_color,
-                          tags=(key, 'chip', cell_tag))
+            texts.append(c.create_text(x + h + 3, y + h / 2, anchor='w', text=name, font=F(9, 'bold'),
+                                       fill=text_color, tags=(key, 'chip', cell_tag)))
         else:
-            c.create_text(x + w / 2, y + h / 2, text=label_text, font=F(7, 'bold'), fill=text_color,
-                          tags=(key, 'chip', cell_tag))
+            texts.append(c.create_text(x + w / 2, y + h / 2, text=label_text, font=F(7, 'bold'), fill=text_color,
+                                       tags=(key, 'chip', cell_tag)))
+        self.chip_items[key] = (eid, ds, color, x, y, w, h, cell_tag, rect, badge, texts)
+
+    def restyle(self):
+        """Nur Farben/Leuchtrahmen der Namenschips aktualisieren – ohne den Kalender neu aufzubauen.
+
+        Wird bei Auswahl, Vorschau und Tausch-Countdown genutzt und ist deshalb sofort sichtbar."""
+        if not self.chip_items or self.app.ctx is None:
+            self.render()
+            return
+        c = self.canvas
+        self.app.tip.hide()
+        c.delete('ring')
+        self.hover_key = None
+        for key, (eid, ds, color, x, y, w, h, cell_tag, rect, badge, texts) in self.chip_items.items():
+            if eid not in self.app.ctx.employees:
+                continue
+            fill, text_color, outline, width, ring = self._chip_style(eid, ds, color)
+            c.itemconfigure(rect, fill=fill, outline=outline, width=width)
+            self.chip_rects[key] = (rect, outline, width)
+            for t in texts:
+                c.itemconfigure(t, fill=text_color)
+            if badge:
+                c.itemconfigure(badge, fill=blend(text_color, fill, .78))
+            if ring:
+                self._draw_rings(key, ring, outline, x, y, w, h, cell_tag)
+                c.tag_raise(rect)
+                for item in ([badge] if badge else []) + texts:
+                    c.tag_raise(item)
 
     # -- Interaktion -------------------------------------------------------
     def _key_at(self):
@@ -373,7 +427,7 @@ class CalendarView(tk.Frame):
         c.delete('drag')
         eid, _day = self.dragging
         name = self.app.ctx.employees[eid].name
-        width = self.f_name.measure(name) + 34
+        width = self.measure(self.f_name, name) + 34
         round_rect(c, x + 10, y + 8, x + 10 + width, y + 34, 13, fill=C.ACCENT, outline=C.GLOW, width=2, tags='drag')
         c.create_text(x + 24, y + 21, anchor='w', text='⇄  ' + name, font=F(9, 'bold'), fill='#ffffff', tags='drag')
         target = self._key_at_point(x, y)
@@ -602,6 +656,7 @@ class App(tk.Tk):
         self.pending = None
         self._pending_job = None
         self._pending_deadline = 0.0
+        self.busy = False
         self.view_mode = 'week' if self.store.setting('ui_view_mode', 'month') == 'week' else 'month'
         today = date.today()
         self.week_start = today - timedelta(days=today.weekday())
@@ -620,7 +675,9 @@ class App(tk.Tk):
         self.bind('<Next>', lambda _e: self._plan_key(lambda: self.step_period(1)))
         self.bind('<Escape>', lambda _e: self.cancel_pending() if self.pending else (self.selected and self.cancel_swap()))
         self.bind('<Return>', lambda _e: self.pending and self._plan_key(self.confirm_swap))
-        self.bind('<Control-z>', lambda _e: self.undo_swap())
+        self.bind('<Control-z>', lambda _e: self._text_safe(self.undo_step))
+        self.bind('<Control-y>', lambda _e: self._text_safe(self.redo_step))
+        self.bind('<Control-Z>', lambda _e: self._text_safe(self.redo_step))  # Strg+Umschalt+Z
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self.deiconify()
         enable_windows_polish(self)
@@ -635,6 +692,11 @@ class App(tk.Tk):
         self.tip.hide()
         self.store.close()
         self.destroy()
+
+    def _text_safe(self, fn):
+        # In Textfeldern bleibt Strg+Z das normale Rückgängig des Feldes
+        if not isinstance(self.focus_get(), (ttk.Entry, ttk.Combobox, ttk.Spinbox, tk.Entry, tk.Text)):
+            fn()
 
     def _plan_key(self, fn):
         if self.current_page == 'plan' and not isinstance(self.focus_get(), (ttk.Combobox, ttk.Entry)):
@@ -679,7 +741,7 @@ class App(tk.Tk):
         self.status_dot.create_oval(3, 3, 11, 11, fill=C.OK, outline='')
         self.status_label = tk.Label(status, text='Bereit.', bg=C.SIDEBAR, fg=C.MUTED, font=F(9), anchor='w')
         self.status_label.pack(side='left', fill='x', expand=True, pady=6)
-        self.status_undo = ttk.Button(status, text='↶ Rückgängig', command=self.undo_swap)
+        self.status_undo = ttk.Button(status, text='↶ Rückgängig', command=self.undo_step)
         self.content = tk.Frame(self.main, bg=C.BG)
         self.content.pack(fill='both', expand=True)
 
@@ -696,6 +758,8 @@ class App(tk.Tk):
             self.status_undo.pack_forget()
 
     def show_page(self, key):
+        if self.busy:  # während „Monat planen“ rechnet, keine anderen Änderungen zulassen
+            return
         self.tip.hide()
         if self.pending and key != 'plan':
             self.cancel_pending()
@@ -748,9 +812,13 @@ class App(tk.Tk):
         self.side_btn = ttk.Button(right, text='◧  Übersicht', command=self.toggle_side)
         self.side_btn.pack(side='right', padx=(8, 0))
         attach_tooltip(self.side_btn, self.tip, 'Seitenpanel mit Übersicht und Tauschassistent ein-/ausblenden')
-        self.undo_btn = ttk.Button(right, text='↶', style='Icon.TButton', width=3, command=self.undo_swap)
+        self._undo_tip = self._redo_tip = ''
+        self.redo_btn = ttk.Button(right, text='↷', style='Icon.TButton', width=3, command=self.redo_step)
+        self.redo_btn.pack(side='right', fill='y', padx=(4, 0))
+        attach_tooltip(self.redo_btn, self.tip, lambda: self._redo_tip)
+        self.undo_btn = ttk.Button(right, text='↶', style='Icon.TButton', width=3, command=self.undo_step)
         self.undo_btn.pack(side='right', fill='y')
-        attach_tooltip(self.undo_btn, self.tip, 'Letzten Tausch rückgängig machen (Strg+Z)')
+        attach_tooltip(self.undo_btn, self.tip, lambda: self._undo_tip)
         bar = tk.Frame(p, bg=C.BG)
         bar.pack(fill='x', padx=22, pady=(6, 8))
         tk.Label(bar, text='Bereich', bg=C.BG, fg=C.MUTED, font=F(9)).pack(side='left')
@@ -844,6 +912,8 @@ class App(tk.Tk):
 
     def _apply_side(self):
         if self.side_open:
+            if getattr(self, '_side_dirty', True) and self.ctx is not None:
+                self.render_side()
             self.side_outer.grid()
             self.side_btn.configure(style='ToggleOn.TButton')
         else:
@@ -928,7 +998,7 @@ class App(tk.Tk):
         if self.shift_filter not in self.ctx.shifts:
             self.shift_filter = None
             self.shift_var.set('Alle Schichten')
-        self.undo_btn.state(['!disabled'] if core.last_undoable_swap(self.store) else ['disabled'])
+        self.update_history_buttons()
         if self.selected:
             self._compute_swap()
         self.cal.render()
@@ -937,6 +1007,8 @@ class App(tk.Tk):
     # -- Tauschassistent ---------------------------------------------------
     def chip_clicked(self, eid, day):
         """1. Klick wählt eine Person aus, 2. Klick auf eine andere Person startet den Tausch."""
+        if self.busy:
+            return
         iso = day.isoformat()
         if self.selected is None:
             self.select_chip(eid, day)
@@ -975,7 +1047,7 @@ class App(tk.Tk):
         self.preview = None
         self.show_invalid = False
         self._compute_swap()
-        self.cal.render()
+        self.cal.restyle()
         self.render_side()
         name = self.ctx.employees[eid].name
         if self.valid_options:
@@ -1023,7 +1095,7 @@ class App(tk.Tk):
         self.pending = opt
         self._pending_total = delay
         self._pending_deadline = time.monotonic() + delay
-        self.cal.render()
+        self.cal.restyle()
         self.render_side()
         ctx = self.ctx
         a, b = ctx.employees[opt.a_id].name, ctx.employees[opt.b_id].name
@@ -1065,7 +1137,7 @@ class App(tk.Tk):
     def cancel_pending(self):
         if self._stop_pending():
             self.preview, self.preview_marks = None, set()
-            self.cal.render()
+            self.cal.restyle()
             self.render_side()
             self.set_status('Tausch abgebrochen – es wurde nichts gespeichert.', tone='warn')
 
@@ -1089,7 +1161,7 @@ class App(tk.Tk):
         self.preview = opt
         self.preview_marks = {(opt.b_id, opt.b_day.isoformat())} if opt.b_day else set()
         if render:
-            self.cal.render()
+            self.cal.restyle()
             self.render_side(keep_scroll=True)
 
     def cancel_swap(self, render=True):
@@ -1098,7 +1170,7 @@ class App(tk.Tk):
         self.swap_options, self.valid_options = [], []
         self.highlights, self.preview_marks = set(), set()
         if render and 'plan' in self.pages:
-            self.cal.render()
+            self.cal.restyle()
             self.render_side()
 
     def confirm_swap(self):
@@ -1117,31 +1189,73 @@ class App(tk.Tk):
         self.refresh_plan()
         self.set_status(f'Tausch gespeichert: {description}', undo=True)
 
-    def undo_swap(self):
+    def undo_swap(self):  # Kompatibilität
+        self.undo_step()
+
+    def undo_step(self):
+        """Einen Schritt zurück. Mehrfach klicken = mehrere Schritte. Ohne Rückfrage, weil „Wiederholen“
+        jeden Schritt wiederherstellen kann."""
+        self._history_step(undo=True)
+
+    def redo_step(self):
+        self._history_step(undo=False)
+
+    def _history_step(self, undo):
+        if self.busy:
+            return
         if self.pending:
             self.cancel_pending()
             return
-        row = core.last_undoable_swap(self.store)
-        if not row:
-            info(self, 'Rückgängig', 'Kein Tausch zum Rückgängigmachen vorhanden.',
-                 'Rückgängig machen gilt für Tausche aus dem Tauschassistenten. Änderungen in der Tagesplanung '
-                 'oder durch „Monat planen“ werden vorher einzeln bestätigt.')
-            return
-        if not ask(self, 'Tausch rückgängig machen', 'Letzten Tausch rückgängig machen?',
-                   f"{row['description']}\n(gespeichert am {row['created_at'].replace('T', ' um ')})",
-                   ok='Rückgängig machen'):
-            return
         try:
-            description = core.undo_last_swap(self.store)
+            description = core.undo_last_change(self.store) if undo else core.redo_next_change(self.store)
         except StaleSwapError as exc:
-            info(self, 'Rückgängig nicht möglich', 'Rückgängig machen wurde abgebrochen.', str(exc), tone='danger')
+            info(self, 'Rückgängig' if undo else 'Wiederholen', 'Dieser Schritt ist nicht möglich.', str(exc),
+                 tone='warn')
             return
         self.cancel_swap(render=False)
-        self.refresh_plan()
-        self.set_status(f'Tausch rückgängig gemacht: {description}', tone='warn')
+        self.refresh_current_page()
+        next_undo, n_undo, next_redo, n_redo = core.undo_info(self.store)
+        if undo:
+            self.set_status(f'Rückgängig: {description} · noch {n_undo} Schritt(e) zurück möglich, '
+                            'Wiederholen mit ↷ / Strg+Y', tone='warn')
+        else:
+            self.set_status(f'Wiederholt: {description}' + (f' · noch {n_redo} Schritt(e) vor' if n_redo else ''))
+
+    def refresh_current_page(self):
+        {'plan': self.refresh_plan, 'staff': self.refresh_staff, 'leave': self.refresh_leave,
+         'hours': self.refresh_hours, 'shifts': self.refresh_shifts}[self.current_page]()
+        self.update_history_buttons()
+
+    def update_history_buttons(self):
+        if 'plan' not in self.pages:
+            return
+        next_undo, n_undo, next_redo, n_redo = core.undo_info(self.store)
+        self.undo_btn.state(['!disabled'] if n_undo else ['disabled'])
+        self.redo_btn.state(['!disabled'] if n_redo else ['disabled'])
+        self._undo_tip = (f'Rückgängig (Strg+Z): {next_undo}\n{n_undo} Schritt(e) gespeichert' if n_undo
+                          else 'Nichts rückgängig zu machen')
+        self._redo_tip = (f'Wiederholen (Strg+Y): {next_redo}\n{n_redo} Schritt(e)' if n_redo
+                          else 'Nichts zu wiederholen')
 
     # -- Seitenpanel -------------------------------------------------------
     def render_side(self, keep_scroll=False):
+        if not self.side_open:
+            # Eingeklappt: nichts aufbauen (spart Zeit), nur die kleine Infokarte aktualisieren.
+            self._side_dirty = True
+            self.update_selcard()
+            return
+        # Kalender-Feedback zuerst zeigen, das Seitenpanel kurz danach aufbauen (fühlt sich sofort an).
+        if getattr(self, '_side_job', None):
+            self.after_cancel(self._side_job)
+        self._side_keep = keep_scroll or getattr(self, '_side_keep', False)
+        self._side_job = self.after(15, self._render_side_now)
+
+    def _render_side_now(self):
+        self._side_job = None
+        keep_scroll, self._side_keep = self._side_keep, False
+        if not self.side_open:
+            return
+        self._side_dirty = False
         pos = self.side_body.canvas.yview()[0] if keep_scroll else 0
         self.side_body.clear()
         for child in self.side_foot.winfo_children():
@@ -1310,10 +1424,10 @@ class App(tk.Tk):
 
         if n_valid:
             section(inner, f'Vorschläge ({n_valid})')
-            for opt in self.valid_options[:30]:
+            for opt in self.valid_options[:12]:
                 self._option_card(inner, opt)
-            if n_valid > 30:
-                label(inner, f'+ {n_valid - 30} weitere gültige Vorschläge', C.MUTED)
+            if n_valid > 12:
+                label(inner, f'+ {n_valid - 12} weitere – im Kalender leuchten alle Partner', C.MUTED)
 
         invalid = [o for o in self.swap_options if not o.valid]
         if invalid:
@@ -1456,12 +1570,16 @@ class App(tk.Tk):
 
     # -- Aktionen ----------------------------------------------------------
     def open_day(self, day):
+        if self.busy:
+            return
         self.tip.hide()
         if self.pending:
             self.cancel_pending()
         DayDialog(self, day)
 
     def generate(self):
+        if self.busy:
+            return
         ctx = self.ctx
         if not ctx.active:
             info(self, 'Monat planen', 'Es gibt noch keine aktiven Mitarbeitenden.', 'Lege zuerst Mitarbeitende an.')
@@ -1486,11 +1604,80 @@ class App(tk.Tk):
         if mode == 'replace' and existing and not ask(
                 self, 'Monat neu planen', f'{existing} bestehende Dienste ersetzen?',
                 f'Alle Einträge im {month_name} werden durch einen neuen Entwurf ersetzt. Urlaube bleiben erhalten. '
-                'Dieser Schritt kann nicht über „Rückgängig“ zurückgenommen werden.',
+                'Der ganze Planlauf lässt sich danach mit einem Klick auf ↶ (Rückgängig) zurücknehmen.',
                 ok='Ja, neu planen', tone='warn', ok_style='Danger.TButton'):
             return
-        result = core.generate_month(self.store, self.month, clear_existing=(mode == 'replace'),
-                                     fill_hours=self.fill_hours_enabled())
+        self._run_generation(self.month, mode == 'replace')
+
+    def _run_generation(self, month, clear):
+        """Rechnet den Entwurf in einem Hintergrund-Thread (eigene Datenbankverbindung), damit das Fenster
+        nicht einfriert. Gespeichert wird danach im Hauptthread als ein Rückgängig-Schritt."""
+        self.cancel_swap(render=False)
+        self.busy = True
+        self.config(cursor='watch')
+        self.set_status(f'Plane {MONTHS[month.month - 1]} {month.year} … mehrere Entwürfe werden verglichen.',
+                        tone='warn')
+        self._show_busy(f'Plane {MONTHS[month.month - 1]} {month.year} …',
+                        'Mehrere Entwürfe werden berechnet und der fairste gespeichert.')
+        box = {}
+        fill = self.fill_hours_enabled()
+
+        def work():
+            reader = core.ReadStore(self.store.path)
+            try:
+                box['plan'] = core.compute_month_plan(reader, month, clear, fill_hours=fill)
+            except Exception as exc:  # Fehler im Hauptthread anzeigen
+                box['error'] = exc
+            finally:
+                reader.close()
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.after(80, poll)
+                return
+            self.busy = False
+            self.config(cursor='')
+            self._hide_busy()
+            if 'error' in box:
+                info(self, 'Planung fehlgeschlagen', 'Der Entwurf konnte nicht berechnet werden.', str(box['error']),
+                     tone='danger')
+                return
+            result = core.save_month_plan(self.store, month, box.get('plan'), clear)
+            self._after_generation(month, result)
+        self.after(80, poll)
+
+    def _show_busy(self, title, text):
+        self.busy_card = RoundedCard(self.cal, fill=blend(C.ACCENT, C.SURFACE, .8), border=C.ACCENT_SOFT, radius=16,
+                                     padx=24, pady=16, outer_bg=C.BG)
+        tk.Label(self.busy_card.inner, text=title, bg=self.busy_card.fill, fg='#ffffff', font=F(12, 'bold')).pack()
+        tk.Label(self.busy_card.inner, text=text, bg=self.busy_card.fill, fg=C.GLOW, font=F(9)).pack(pady=(4, 8))
+        bar = tk.Canvas(self.busy_card.inner, width=260, height=6, bg=self.busy_card.fill, highlightthickness=0)
+        bar.pack()
+        self.busy_card.place(relx=.5, rely=.4, anchor='center')
+        tk.Misc.tkraise(self.busy_card)
+        state = {'x': 0}
+
+        def spin():
+            if not self.busy or not bar.winfo_exists():
+                return
+            bar.delete('all')
+            round_rect(bar, 0, 0, 260, 6, 3, fill=blend(C.ACCENT, C.SURFACE, .55), outline='')
+            x = state['x'] = (state['x'] + 12) % 320
+            round_rect(bar, max(0, x - 80), 0, min(260, x), 6, 3, fill=C.GLOW, outline='')
+            self.after(40, spin)
+        spin()
+
+    def _hide_busy(self):
+        card = getattr(self, 'busy_card', None)
+        if card is not None:
+            card.destroy()
+            self.busy_card = None
+
+    def _after_generation(self, month, result):
+        self.month = month
         self.last_generation = (self.month, result)
         self.cancel_swap(render=False)
         self.refresh_plan()
@@ -1543,6 +1730,7 @@ class App(tk.Tk):
                    command=lambda: EmployeeForm(self)).pack(side='left')
         ttk.Button(bar, text='Bearbeiten', command=self.edit_employee).pack(side='left', padx=8)
         ttk.Button(bar, text='Aktiv / Inaktiv', command=self.toggle_employee).pack(side='left')
+        ttk.Button(bar, text='Löschen', style='Danger.TButton', command=self.delete_employee).pack(side='left', padx=8)
         self.staff_tree = self._tree(p, [('name', 'Name', 220), ('role', 'Bereich / Qualifikation', 190),
                                          ('hours', 'Std./Woche', 90), ('days', 'Max. Tage', 80),
                                          ('shifts', 'Einsetzbar für', 220), ('prefs', 'Wünsche', 230),
@@ -1610,6 +1798,43 @@ class App(tk.Tk):
         self.store.run('UPDATE employees SET active=? WHERE id=?', (0 if e['active'] else 1, e['id']))
         self.refresh_staff()
         self.update_demo_badge()
+
+    def delete_employee(self):
+        sel = self.staff_tree.selection()
+        if not sel:
+            info(self, 'Mitarbeitende', 'Bitte zuerst eine Person auswählen.')
+            return
+        eid = int(sel[0])
+        e = self.store.all('SELECT * FROM employees WHERE id=?', (eid,))[0]
+        impact = core.employee_delete_impact(self.store, eid)
+        lines = [('head', 'Wird endgültig entfernt'),
+                 ('block', f"{impact['future']} zukünftige Dienste (ab heute) – diese Plätze werden danach offen"),
+                 ('block', f"{impact['past']} vergangene Dienste – fehlen danach in Auswertung und CSV-Export"),
+                 ('block', f"{impact['leave']} Urlaubseinträge sowie Schichteignungen und Wünsche"),
+                 ('head', 'Sicherheit'),
+                 ('ok', 'Vor dem Löschen wird automatisch eine Sicherung in data/backups angelegt.'),
+                 ('info', 'Tipp: „Aktiv / Inaktiv“ blendet die Person aus, ohne Plandaten zu verlieren.')]
+        tag = ' (Testdaten)' if e['is_demo'] else ''
+        if not ask(self, 'Mitarbeiter löschen', f"{e['name']}{tag} endgültig löschen?",
+                   'Das Löschen lässt sich in der App nicht rückgängig machen.', lines,
+                   ok='Endgültig löschen', tone='danger', ok_style='Danger.TButton'):
+            return
+        if impact['assignments'] and not e['is_demo'] and not ask(
+                self, 'Wirklich löschen?', f"Wirklich alle {impact['assignments']} Dienste von {e['name']} löschen?",
+                'Letzte Rückfrage, weil echte Plandaten betroffen sind.', ok='Ja, löschen', tone='danger',
+                ok_style='Danger.TButton'):
+            return
+        try:
+            name, backup = core.delete_employee(self.store, eid)
+        except ValueError as exc:
+            info(self, 'Löschen nicht möglich', str(exc), tone='danger')
+            return
+        if self.selected and self.selected[0] == eid:
+            self.cancel_swap(render=False)
+        self.refresh_staff()
+        self.update_demo_badge()
+        self.set_status(f'„{name}“ gelöscht ({impact["future"]} zukünftige Dienste jetzt offen). '
+                        f'Sicherung: {os.path.basename(backup)}', tone='warn')
 
     # =====================================================================
     # Urlaub

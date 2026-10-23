@@ -91,7 +91,7 @@ def round_rect(canvas, x1, y1, x2, y2, r=8, **kw):
     r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return canvas.create_polygon(pts, smooth=True, splinesteps=10, **kw)
+    return canvas.create_polygon(pts, smooth=True, splinesteps=6, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +751,7 @@ class Dialog(tk.Toplevel):
             box = tk.Frame(wrap, bg=C.BORDER, padx=1, pady=1)
             box.pack(fill='both', expand=True, pady=(12, 0))
             text = tk.Text(box, bg=C.SURFACE2, fg=C.TEXT, font=F(9), wrap='word', relief='flat', padx=12, pady=10,
-                           height=min(16, max(3, len(lines) + 1)), width=60, highlightthickness=0, cursor='arrow')
+                           height=min(18, max(3, len(lines) + 3)), width=60, highlightthickness=0, cursor='arrow')
             bar = ttk.Scrollbar(box, orient='vertical', command=text.yview)
             text.configure(yscrollcommand=bar.set)
             for status, color in (('ok', C.OK), ('warn', C.WARN), ('block', C.DANGER), ('info', C.TEXT),

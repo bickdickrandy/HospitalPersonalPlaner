@@ -12,7 +12,7 @@ python main.py
 
 **Erster Start mit leerer Datenbank:** Es werden zehn fiktive **Demo-Personen** („Demo Alpha“ … „Demo Juliett“, markiert als *Testdaten*), drei Standardschichten (Früh 2–4, Spät 2–4, Nacht 1–2 Personen), gestaffelte **Testurlaube** im aktuellen und im Folgemonat und ein Beispielplan für den aktuellen Monat angelegt. Das passiert nur einmal und nur, wenn noch keine Mitarbeitenden existieren. Bestehende Pläne werden nie überschrieben.
 
-**Bestehende Datenbank:** Beim ersten Start nach dem Update wird die Datenbank automatisch migriert. Vorher wird eine Sicherung unter `data/backups/` angelegt. Die Migration ist wiederholbar (Schema-Version über `PRAGMA user_version`, aktuell 4) und ändert keine Plandaten. Personen, deren Name mit `Demo ` beginnt, werden als Testdaten gekennzeichnet.
+**Bestehende Datenbank:** Beim ersten Start nach dem Update wird die Datenbank automatisch migriert. Vorher wird eine Sicherung unter `data/backups/` angelegt. Die Migration ist wiederholbar (Schema-Version über `PRAGMA user_version`, aktuell 5) und ändert keine Plandaten. Personen, deren Name mit `Demo ` beginnt, werden als Testdaten gekennzeichnet.
 
 ## Funktionen
 
@@ -34,7 +34,7 @@ python main.py
 2. Einen zweiten Namen anklicken **oder den ersten Namen mit der Maus auf den zweiten ziehen** → die App prüft den Tausch sofort (gleicher Tag oder zwei verschiedene Tage im Monat).
    - **Zulässig:** Unten im Kalender erscheint ein Hinweisbalken mit Countdown. Nach Ablauf der **Bedenkzeit (Standard 5 s)** wird gespeichert. Bis dahin: **Esc**, „Abbrechen“ oder erneuter Klick auf die erste Person bricht ab – nichts wird gespeichert. „Jetzt tauschen“ bzw. Enter speichert sofort.
    - **Nicht zulässig:** Es wird nichts geändert; der angeklickte Name wird rot markiert und das Seitenpanel nennt die Gründe.
-3. Danach stellt „Rückgängig“ (↶ bzw. Strg+Z) den letzten Tausch wieder her – aber nur, wenn die betroffenen Tage seitdem nicht verändert wurden.
+3. Danach lässt sich der Tausch mit ↶ bzw. Strg+Z zurücknehmen (siehe „Rückgängig & Wiederholen“).
 
 Die Bedenkzeit ist unter „Schichten & Regeln“ einstellbar (0–30 s; 0 = sofort speichern). Wird während eines laufenden Countdowns die App geschlossen, der Monat gewechselt oder ein Tag geöffnet, wird der Tausch **nicht** gespeichert.
 
@@ -46,6 +46,15 @@ Die Bedenkzeit ist unter „Schichten & Regeln“ einstellbar (0–30 s; 0 = sof
 
 Geprüft werden für beide Seiten: Schichteignung, Urlaub, einzelne Abwesenheitstage, doppelte Schicht am selben Tag, max. Arbeitstage pro Woche, aufeinanderfolgende Arbeitstage, Ruhezeit zwischen Schichten (aus den Uhrzeiten berechnet) und Mindestbesetzung nach dem Tausch. Vor dem Speichern wird erneut gegen den aktuellen Datenbankstand geprüft.
 
+### Rückgängig & Wiederholen (mehrere Schritte)
+Jede Planänderung ist ein Schritt im Verlauf: Tausch, Tagesplanung, „Monat planen“ (der ganze Planlauf als ein Schritt), Urlaub eintragen/entfernen (inkl. der dadurch entfernten Dienste) sowie Testurlaube anlegen/entfernen.
+
+- **↶** (Strg+Z) nimmt den jüngsten Schritt zurück – mehrfach klicken geht beliebig viele Schritte zurück (bis zu 200 werden gespeichert, auch über einen Neustart hinweg).
+- **↷** (Strg+Y oder Strg+Umschalt+Z) stellt zurückgenommene Schritte wieder her. Eine neue Änderung verwirft die „Wiederholen“-Liste.
+- Der Tooltip am Pfeil zeigt, welcher Schritt als Nächstes zurückgenommen wird.
+- Sicherheit: Ein Schritt wird nur zurückgesetzt, wenn die betroffenen Tage noch genau so aussehen wie direkt nach diesem Schritt. Sonst bricht die App mit Erklärung ab und überschreibt nichts.
+- Nicht über den Verlauf: Löschen von Mitarbeitenden (dafür gibt es die automatische Sicherung) und Änderungen an Schichtmodellen oder Stammdaten.
+
 ### Tagesplanung
 Klick auf einen Tag oder eine Schichtkarte öffnet die Tagesplanung: pro Person „Frei“ oder eine Schicht wählen, Besetzung wird live angezeigt. Vor dem Speichern zeigt die App alle Änderungen und Regelverstöße; Speichern trotz Verstoß ist nur nach ausdrücklicher Bestätigung möglich.
 
@@ -53,6 +62,11 @@ Klick auf einen Tag oder eine Schichtkarte öffnet die Tagesplanung: pro Person 
 Urlaub mit Datumsauswahl (Kalender-Popup, keine Freitext-Daten) eintragen, anzeigen, filtern und entfernen. Liegen im Zeitraum bereits Dienste, listet die App diese auf und entfernt sie nur nach Bestätigung. Überschneidungen werden gemeldet.
 
 **Testurlaube:** „＋ Testurlaube anlegen“ plant für Demo-Personen gestaffelte Urlaube (3–5 Tage, nie zwei Demo-Personen gleichzeitig) im angezeigten und im Folgemonat. Vorher zeigt die App die Zeiträume und wie viele Dienste dadurch frei werden; gespeichert wird erst nach Bestätigung. Echte Mitarbeitende und Personen mit bereits eingetragenem Urlaub werden nie berührt. „Testurlaube entfernen“ löscht nur Einträge mit der Notiz „Testurlaub (Testdaten)“.
+
+### Geschwindigkeit
+- Ein Klick auf einen Namen färbt nur die betroffenen Chips um, statt den Kalender neu aufzubauen. Textbreiten werden zwischengespeichert.
+- „Monat planen“ rechnet in einem Hintergrund-Thread mit eigener Datenbankverbindung; das Fenster bleibt bedienbar, und eine Fortschrittsanzeige erscheint.
+- Das eingeklappte Seitenpanel wird erst beim Öffnen aufgebaut.
 
 ### Automatische Planung
 „Monat planen“ bietet „Nur offene Plätze füllen“ (bestehende Einträge bleiben) oder „Komplett neu planen“ (mit zusätzlicher Bestätigung). Der Generator arbeitet in zwei Schritten:
@@ -67,6 +81,7 @@ Eigene Seite mit Soll/Ist-Stunden, Differenz und Status (erfüllt / unter / übe
 
 ### Mitarbeitende, Schichten & Hausregeln
 - Mitarbeitende mit Bereich/Qualifikation, Wochenstunden, max. Arbeitstagen, Wünschen, einzelnen Abwesenheitstagen (per Datumsauswahl) und Schichteignung; aktivieren/deaktivieren.
+- **Mitarbeitende löschen:** „Löschen“ zeigt vorher, wie viele zukünftige und vergangene Dienste sowie Urlaube mit entfernt werden. Gelöscht wird erst nach Bestätigung (bei echten Plandaten mit zweiter Rückfrage). Vorher legt die App automatisch eine Sicherung in `data/backups/` an. Wer Plandaten behalten will, nutzt „Aktiv / Inaktiv“.
 - Schichtmodelle mit Uhrzeiten, Stunden, Farbe, Mindest- und Maximalbesetzung (0 = unbegrenzt; bestehende Schichten erhalten bei der Migration Mindestbesetzung + 2). Schichten über Mitternacht (z. B. 22:00–06:00) werden korrekt bis in den Folgetag gerechnet.
 - Hausregeln: Mindestruhezeit (Standard 11 h), max. Arbeitstage am Stück (Standard 5), Bedenkzeit beim Klick-Tausch (Standard 5 s), Toleranz für Soll-Stunden (Standard ± 4 h) und ob Zusatzdienste geplant werden.
 - CSV-Export des Monats (Semikolon, UTF-8 mit BOM, Spalten wie bisher).
