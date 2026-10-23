@@ -2150,7 +2150,7 @@ class App(tk.Tk):
         transitions = self.store.all('''SELECT r.id,a.name AS after_name,b.name AS blocked_name,r.days_after
             FROM shift_transition_rules r JOIN shifts a ON a.id=r.after_shift_id
             JOIN shifts b ON b.id=r.blocked_shift_id ORDER BY a.start,b.start''')
-        streaks = self.store.all('''SELECT r.shift_id,s.name,r.max_consecutive,r.rest_days
+        streaks = self.store.all('''SELECT r.shift_id,s.name,r.max_consecutive,r.rest_days,r.rest_after_any_run
             FROM shift_streak_rules r JOIN shifts s ON s.id=r.shift_id ORDER BY s.start''')
         if not transitions and not streaks:
             tk.Label(self.transition_rows, text='Noch keine Schichtregeln hinterlegt.', bg=C.SURFACE,
@@ -2166,8 +2166,9 @@ class App(tk.Tk):
         for row in streaks:
             line = tk.Frame(self.streak_rows, bg=C.SURFACE)
             line.pack(fill='x', pady=2)
+            pause = ' nach jeder Serie' if row['rest_after_any_run'] else ''
             tk.Label(line, text=f"{row['name']} · höchstens {row['max_consecutive']} hintereinander · danach "
-                     f"{row['rest_days']} Ruhetage", bg=C.SURFACE, fg=C.TEXT, font=F(9), anchor='w').pack(
+                     f"{row['rest_days']} Ruhetage{pause}", bg=C.SURFACE, fg=C.TEXT, font=F(9), anchor='w').pack(
                          side='left', fill='x', expand=True)
             ttk.Button(line, text='Entfernen', command=lambda sid=row['shift_id']: self.delete_streak_rule(sid)).pack(
                 side='right')
@@ -2424,7 +2425,7 @@ class TransitionRuleForm(BaseWindow):
 
 class StreakRuleForm(BaseWindow):
     def __init__(self, app):
-        super().__init__(app, 'Schichtserien-Regel', 600, 390)
+        super().__init__(app, 'Schichtserien-Regel', 620, 450)
         f = tk.Frame(self, bg=C.SURFACE, padx=24, pady=18)
         f.pack(fill='both', expand=True)
         shifts = app.store.all('SELECT id,name,start,end FROM shifts ORDER BY start,name')
@@ -2432,6 +2433,7 @@ class StreakRuleForm(BaseWindow):
         choices = list(self.ids)
         self.shift_var = tk.StringVar(value=choices[0] if choices else '')
         self.max_var, self.rest_var = tk.StringVar(value='4'), tk.StringVar(value='2')
+        self.rest_any_var = tk.BooleanVar(value=False)
         tk.Label(f, text='Für welche Schicht gilt die Serienregel?', bg=C.SURFACE, fg=C.MUTED,
                  font=F(9)).pack(anchor='w')
         ttk.Combobox(f, textvariable=self.shift_var, values=choices, state='readonly').pack(fill='x', pady=(4, 14))
@@ -2442,11 +2444,15 @@ class StreakRuleForm(BaseWindow):
         ttk.Spinbox(row, from_=1, to=14, textvariable=self.max_var, width=5).pack(side='left', padx=10)
         row = tk.Frame(f, bg=C.SURFACE)
         row.pack(fill='x', pady=4)
-        tk.Label(row, text='Ruhetage nach Erreichen der Grenze:', bg=C.SURFACE, fg=C.MUTED,
+        tk.Label(row, text='Anzahl der Ruhetage:', bg=C.SURFACE, fg=C.MUTED,
                  font=F(9)).pack(side='left')
         ttk.Spinbox(row, from_=0, to=14, textvariable=self.rest_var, width=5).pack(side='left', padx=10)
-        tk.Label(f, text='Beispiel: höchstens 4 Spätdienste nacheinander, danach 2 volle Tage ohne Dienst.',
-                 bg=C.SURFACE, fg=C.DIM, font=F(8)).pack(anchor='w', pady=(10, 0))
+        ttk.Checkbutton(f, text='Ruhetage nach jeder Serie verlangen – auch bei kürzeren Serien',
+                        variable=self.rest_any_var, style='Surface.TCheckbutton').pack(anchor='w', pady=(10, 0))
+        tk.Label(f, text='Beispiel: Bei Nachtdienst, max. 4 und 2 Ruhetagen sind nach 1, 2, 3 oder 4 '
+                 'Nächten jeweils die folgenden 2 Tage dienstfrei. Während der Serie dürfen Nächte '
+                 'aufeinanderfolgen.', bg=C.SURFACE, fg=C.DIM, font=F(8), justify='left',
+                 wraplength=560).pack(anchor='w', pady=(7, 0))
         foot = tk.Frame(self, bg=C.SURFACE2, padx=24, pady=12)
         foot.pack(fill='x', side='bottom')
         ttk.Button(foot, text='Speichern', style='Accent.TButton', command=self.save).pack(side='right')
@@ -2463,9 +2469,11 @@ class StreakRuleForm(BaseWindow):
             info(self, 'Eingabe prüfen', 'Maximalfolge muss 1–14, Ruhetage 0–14 betragen.', tone='danger')
             return
         with self.app.store.db:
-            self.app.store.db.execute('''INSERT INTO shift_streak_rules(shift_id,max_consecutive,rest_days)
-                VALUES(?,?,?) ON CONFLICT(shift_id) DO UPDATE SET max_consecutive=excluded.max_consecutive,
-                rest_days=excluded.rest_days''', (shift_id, maximum, rest))
+            self.app.store.db.execute('''INSERT INTO shift_streak_rules
+                (shift_id,max_consecutive,rest_days,rest_after_any_run) VALUES(?,?,?,?)
+                ON CONFLICT(shift_id) DO UPDATE SET max_consecutive=excluded.max_consecutive,
+                rest_days=excluded.rest_days,rest_after_any_run=excluded.rest_after_any_run''',
+                (shift_id, maximum, rest, int(self.rest_any_var.get())))
         self.destroy()
         self.app.refresh_shifts()
         self.app.set_status('Schichtserien-Regel gespeichert. Planer, Prüfung und Tauschassistent wenden sie an.')
