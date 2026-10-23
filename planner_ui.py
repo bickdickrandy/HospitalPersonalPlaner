@@ -2101,7 +2101,25 @@ class App(tk.Tk):
         self.shift_tree = self._tree(p, [('name', 'Schicht', 220), ('time', 'Arbeitszeit', 160),
                                          ('hours', 'Anrechenbare Stunden', 160), ('coverage', 'Mindestbesetzung', 150),
                                          ('max', 'Maximalbesetzung', 150), ('color', 'Farbe', 110)])
+        self.shift_tree.configure(height=6)
         self.shift_tree.bind('<Double-1>', lambda _e: self.edit_shift())
+
+        rule_card = RoundedCard(p, fill=C.SURFACE, border=C.BORDER, radius=14, padx=16, pady=12)
+        rule_card.pack(fill='x', padx=26, pady=(0, 18))
+        tk.Label(rule_card.inner, text='SCHICHTFOLGEN & SERIEN', bg=C.SURFACE, fg=C.ACCENT_SOFT,
+                 font=F(8, 'bold')).pack(anchor='w')
+        tk.Label(rule_card.inner, text='Zum Beispiel: Nach Nachtdienst kein Frühdienst am Folgetag; nach 4 Spätdiensten '
+                 '2 volle Tage Pause. Diese Regeln gelten auch beim Tauschen und manuellen Ändern.',
+                 bg=C.SURFACE, fg=C.MUTED, font=F(9), justify='left', wraplength=900).pack(anchor='w', pady=(4, 8))
+        rule_buttons = tk.Frame(rule_card.inner, bg=C.SURFACE)
+        rule_buttons.pack(fill='x', pady=(0, 6))
+        ttk.Button(rule_buttons, text='＋ Schichtfolge-Regel', command=lambda: TransitionRuleForm(self)).pack(side='left')
+        ttk.Button(rule_buttons, text='＋ Schichtserien-Regel', command=lambda: StreakRuleForm(self)).pack(
+            side='left', padx=8)
+        self.transition_rows = tk.Frame(rule_card.inner, bg=C.SURFACE)
+        self.transition_rows.pack(fill='x', anchor='w')
+        self.streak_rows = tk.Frame(rule_card.inner, bg=C.SURFACE)
+        self.streak_rows.pack(fill='x', anchor='w', pady=(4, 0))
 
     def refresh_shifts(self):
         self.rest_var.set(self.store.setting('min_rest_hours'))
@@ -2117,6 +2135,48 @@ class App(tk.Tk):
             tree.insert('', 'end', iid=str(s['id']), tags=(tag,),
                         values=(f"●  {s['name']}", f"{s['start']}–{s['end']}", fmt_hours(s['hours']), s['coverage'],
                                 s['max_staff'] or 'unbegrenzt', s['color']))
+        self._refresh_configured_rules()
+
+    def _refresh_configured_rules(self):
+        for frame in (self.transition_rows, self.streak_rows):
+            for child in frame.winfo_children():
+                child.destroy()
+        transitions = self.store.all('''SELECT r.id,a.name AS after_name,b.name AS blocked_name,r.days_after
+            FROM shift_transition_rules r JOIN shifts a ON a.id=r.after_shift_id
+            JOIN shifts b ON b.id=r.blocked_shift_id ORDER BY a.start,b.start''')
+        streaks = self.store.all('''SELECT r.shift_id,s.name,r.max_consecutive,r.rest_days
+            FROM shift_streak_rules r JOIN shifts s ON s.id=r.shift_id ORDER BY s.start''')
+        if not transitions and not streaks:
+            tk.Label(self.transition_rows, text='Noch keine Schichtregeln hinterlegt.', bg=C.SURFACE,
+                     fg=C.DIM, font=F(9)).pack(anchor='w', pady=3)
+        for row in transitions:
+            line = tk.Frame(self.transition_rows, bg=C.SURFACE)
+            line.pack(fill='x', pady=2)
+            tk.Label(line, text=f"Nach {row['after_name']} · {row['days_after']} Tag(e) gesperrt: "
+                     f"{row['blocked_name']}", bg=C.SURFACE, fg=C.TEXT, font=F(9), anchor='w').pack(
+                         side='left', fill='x', expand=True)
+            ttk.Button(line, text='Entfernen', command=lambda rid=row['id']: self.delete_transition_rule(rid)).pack(
+                side='right')
+        for row in streaks:
+            line = tk.Frame(self.streak_rows, bg=C.SURFACE)
+            line.pack(fill='x', pady=2)
+            tk.Label(line, text=f"{row['name']} · höchstens {row['max_consecutive']} hintereinander · danach "
+                     f"{row['rest_days']} Ruhetage", bg=C.SURFACE, fg=C.TEXT, font=F(9), anchor='w').pack(
+                         side='left', fill='x', expand=True)
+            ttk.Button(line, text='Entfernen', command=lambda sid=row['shift_id']: self.delete_streak_rule(sid)).pack(
+                side='right')
+
+    def delete_transition_rule(self, rule_id):
+        with self.store.db:
+            self.store.db.execute('DELETE FROM shift_transition_rules WHERE id=?', (rule_id,))
+        self.refresh_shifts()
+        self.set_status('Schichtfolge-Regel entfernt.')
+
+    def delete_streak_rule(self, shift_id):
+        with self.store.db:
+            self.store.db.execute('DELETE FROM shift_streak_rules WHERE shift_id=?', (shift_id,))
+        self.refresh_shifts()
+        self.set_status('Schichtserien-Regel entfernt.')
 
     def save_rules(self):
         try:
@@ -2309,9 +2369,105 @@ class DayDialog(BaseWindow):
                                 tone='warn' if blocking else 'ok')
 
 
+class TransitionRuleForm(BaseWindow):
+    def __init__(self, app):
+        super().__init__(app, 'Schichtfolge-Regel', 600, 380)
+        f = tk.Frame(self, bg=C.SURFACE, padx=24, pady=18)
+        f.pack(fill='both', expand=True)
+        shifts = app.store.all('SELECT id,name,start,end FROM shifts ORDER BY start,name')
+        self.ids = {f"{s['name']} ({s['start']}–{s['end']})": s['id'] for s in shifts}
+        choices = list(self.ids)
+        self.after_var = tk.StringVar(value=choices[0] if choices else '')
+        self.blocked_var = tk.StringVar(value=choices[1] if len(choices) > 1 else (choices[0] if choices else ''))
+        self.days_var = tk.StringVar(value='1')
+        tk.Label(f, text='Nach welcher Schicht?', bg=C.SURFACE, fg=C.MUTED, font=F(9)).pack(anchor='w')
+        ttk.Combobox(f, textvariable=self.after_var, values=choices, state='readonly').pack(fill='x', pady=(4, 12))
+        tk.Label(f, text='Welche Schicht soll danach gesperrt sein?', bg=C.SURFACE, fg=C.MUTED,
+                 font=F(9)).pack(anchor='w')
+        ttk.Combobox(f, textvariable=self.blocked_var, values=choices, state='readonly').pack(fill='x', pady=(4, 12))
+        row = tk.Frame(f, bg=C.SURFACE)
+        row.pack(fill='x')
+        tk.Label(row, text='Für wie viele Folgetage?', bg=C.SURFACE, fg=C.MUTED, font=F(9)).pack(side='left')
+        ttk.Spinbox(row, from_=1, to=14, textvariable=self.days_var, width=5).pack(side='left', padx=10)
+        tk.Label(f, text='Beispiel: Nach Nachtdienst ist Frühdienst am nächsten Tag gesperrt.',
+                 bg=C.SURFACE, fg=C.DIM, font=F(8)).pack(anchor='w', pady=(10, 0))
+        foot = tk.Frame(self, bg=C.SURFACE2, padx=24, pady=12)
+        foot.pack(fill='x', side='bottom')
+        ttk.Button(foot, text='Speichern', style='Accent.TButton', command=self.save).pack(side='right')
+        ttk.Button(foot, text='Abbrechen', command=self.destroy).pack(side='right', padx=8)
+        self.show()
+
+    def save(self):
+        after_id, blocked_id = self.ids.get(self.after_var.get()), self.ids.get(self.blocked_var.get())
+        try:
+            days = int(self.days_var.get())
+            if not after_id or not blocked_id or after_id == blocked_id or not 1 <= days <= 14:
+                raise ValueError
+        except ValueError:
+            info(self, 'Eingabe prüfen', 'Bitte zwei unterschiedliche Schichten und 1–14 Tage auswählen.',
+                 tone='danger')
+            return
+        with self.app.store.db:
+            self.app.store.db.execute('''INSERT INTO shift_transition_rules(after_shift_id,blocked_shift_id,days_after)
+                VALUES(?,?,?) ON CONFLICT(after_shift_id,blocked_shift_id) DO UPDATE SET days_after=excluded.days_after''',
+                (after_id, blocked_id, days))
+        self.destroy()
+        self.app.refresh_shifts()
+        self.app.set_status('Schichtfolge-Regel gespeichert. Planer, Prüfung und Tauschassistent wenden sie an.')
+
+
+class StreakRuleForm(BaseWindow):
+    def __init__(self, app):
+        super().__init__(app, 'Schichtserien-Regel', 600, 390)
+        f = tk.Frame(self, bg=C.SURFACE, padx=24, pady=18)
+        f.pack(fill='both', expand=True)
+        shifts = app.store.all('SELECT id,name,start,end FROM shifts ORDER BY start,name')
+        self.ids = {f"{s['name']} ({s['start']}–{s['end']})": s['id'] for s in shifts}
+        choices = list(self.ids)
+        self.shift_var = tk.StringVar(value=choices[0] if choices else '')
+        self.max_var, self.rest_var = tk.StringVar(value='4'), tk.StringVar(value='2')
+        tk.Label(f, text='Für welche Schicht gilt die Serienregel?', bg=C.SURFACE, fg=C.MUTED,
+                 font=F(9)).pack(anchor='w')
+        ttk.Combobox(f, textvariable=self.shift_var, values=choices, state='readonly').pack(fill='x', pady=(4, 14))
+        row = tk.Frame(f, bg=C.SURFACE)
+        row.pack(fill='x', pady=4)
+        tk.Label(row, text='Maximale Anzahl direkt hintereinander:', bg=C.SURFACE, fg=C.MUTED,
+                 font=F(9)).pack(side='left')
+        ttk.Spinbox(row, from_=1, to=14, textvariable=self.max_var, width=5).pack(side='left', padx=10)
+        row = tk.Frame(f, bg=C.SURFACE)
+        row.pack(fill='x', pady=4)
+        tk.Label(row, text='Ruhetage nach Erreichen der Grenze:', bg=C.SURFACE, fg=C.MUTED,
+                 font=F(9)).pack(side='left')
+        ttk.Spinbox(row, from_=0, to=14, textvariable=self.rest_var, width=5).pack(side='left', padx=10)
+        tk.Label(f, text='Beispiel: höchstens 4 Spätdienste nacheinander, danach 2 volle Tage ohne Dienst.',
+                 bg=C.SURFACE, fg=C.DIM, font=F(8)).pack(anchor='w', pady=(10, 0))
+        foot = tk.Frame(self, bg=C.SURFACE2, padx=24, pady=12)
+        foot.pack(fill='x', side='bottom')
+        ttk.Button(foot, text='Speichern', style='Accent.TButton', command=self.save).pack(side='right')
+        ttk.Button(foot, text='Abbrechen', command=self.destroy).pack(side='right', padx=8)
+        self.show()
+
+    def save(self):
+        shift_id = self.ids.get(self.shift_var.get())
+        try:
+            maximum, rest = int(self.max_var.get()), int(self.rest_var.get())
+            if not shift_id or not 1 <= maximum <= 14 or not 0 <= rest <= 14:
+                raise ValueError
+        except ValueError:
+            info(self, 'Eingabe prüfen', 'Maximalfolge muss 1–14, Ruhetage 0–14 betragen.', tone='danger')
+            return
+        with self.app.store.db:
+            self.app.store.db.execute('''INSERT INTO shift_streak_rules(shift_id,max_consecutive,rest_days)
+                VALUES(?,?,?) ON CONFLICT(shift_id) DO UPDATE SET max_consecutive=excluded.max_consecutive,
+                rest_days=excluded.rest_days''', (shift_id, maximum, rest))
+        self.destroy()
+        self.app.refresh_shifts()
+        self.app.set_status('Schichtserien-Regel gespeichert. Planer, Prüfung und Tauschassistent wenden sie an.')
+
+
 class EmployeeForm(BaseWindow):
     def __init__(self, app, employee_id=None):
-        super().__init__(app, 'Mitarbeiter bearbeiten' if employee_id else 'Mitarbeiter hinzufügen', 720, 700)
+        super().__init__(app, 'Mitarbeiter bearbeiten' if employee_id else 'Mitarbeiter hinzufügen', 760, 930)
         store = app.store
         self.e = store.all('SELECT * FROM employees WHERE id=?', (employee_id,))[0] if employee_id else None
         e = self.e
@@ -2349,6 +2505,31 @@ class EmployeeForm(BaseWindow):
                                                        textvariable=self.vars['max_days'], width=8))
         field('Wünsche', ttk.Entry(f, textvariable=self.vars['preferences']),
               'kommagetrennt, z. B. „Frühdienst bevorzugt, Wochenende vermeiden“')
+        tk.Label(f, text='Feste Wochenschichten', bg=C.SURFACE, fg=C.MUTED, font=F(9)).grid(
+            row=row, column=0, sticky='nw', pady=7, padx=(0, 14))
+        patterns_box = tk.Frame(f, bg=C.SURFACE)
+        patterns_box.grid(row=row, column=1, sticky='ew', pady=7)
+        row += 1
+        shift_rows = store.all('SELECT id,name,start,end FROM shifts ORDER BY start,name')
+        pattern_choices = {'– keine feste Schicht –': None}
+        for shift in shift_rows:
+            pattern_choices[f"{shift['name']} ({shift['start']}–{shift['end']})"] = shift['id']
+        existing_patterns = {int(r['weekday']): r['shift_id'] for r in store.all(
+            'SELECT weekday,shift_id FROM employee_shift_patterns WHERE employee_id=?',
+            (e['id'],))} if e else {}
+        self.pattern_vars = {}
+        for weekday, weekday_name in enumerate(WEEKDAYS_LONG):
+            tk.Label(patterns_box, text=weekday_name, bg=C.SURFACE, fg=C.MUTED, font=F(8), width=13,
+                     anchor='w').grid(row=weekday, column=0, sticky='w', padx=(0, 8), pady=1)
+            var = tk.StringVar(value=next((label for label, sid in pattern_choices.items()
+                                           if sid == existing_patterns.get(weekday)), '– keine feste Schicht –'))
+            ttk.Combobox(patterns_box, textvariable=var, values=list(pattern_choices), state='readonly',
+                         width=32).grid(row=weekday, column=1, sticky='w', pady=1)
+            self.pattern_vars[weekday] = (var, pattern_choices)
+        tk.Label(patterns_box, text='Beispiel: Freitag → Nachtdienst (22:00–06:00). Die Schicht steht im Plan am Freitag.',
+                 bg=C.SURFACE, fg=C.DIM, font=F(8), justify='left').grid(
+                     row=7, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        row += 1
         absence = tk.Frame(f, bg=C.SURFACE)
         ttk.Entry(absence, textvariable=self.vars['unavailable']).pack(side='left', fill='x', expand=True)
         self.absence_pick = DateField(absence, date.today())
@@ -2405,6 +2586,14 @@ class EmployeeForm(BaseWindow):
             info(self, 'Eingabe prüfen', 'Ungültige Abwesenheitstage.', 'Bitte die Datumsauswahl nutzen: ' +
                  ', '.join(bad), tone='danger')
             return
+        eligible_ids = {sid for sid, var in self.checks if var.get()}
+        selected_patterns = [(weekday, choices.get(var.get())) for weekday, (var, choices) in self.pattern_vars.items()
+                             if choices.get(var.get())]
+        disallowed = [sid for _weekday, sid in selected_patterns if eligible_ids and sid not in eligible_ids]
+        if disallowed:
+            info(self, 'Eingabe prüfen', 'Feste Schicht ist nicht als einsetzbar markiert.',
+                 'Markiere die Schicht zusätzlich unter „Einsetzbar für (Schichteignung)“.', tone='danger')
+            return
         values = (v['name'], v['role'], hours, max_days, v['preferences'], ', '.join(days))
         store = self.app.store
         with store.db:
@@ -2418,6 +2607,9 @@ class EmployeeForm(BaseWindow):
             store.db.execute('DELETE FROM eligibility WHERE employee_id=?', (eid,))
             store.db.executemany('INSERT INTO eligibility(employee_id,shift_id) VALUES(?,?)',
                                  [(eid, sid) for sid, var in self.checks if var.get()])
+            store.db.execute('DELETE FROM employee_shift_patterns WHERE employee_id=?', (eid,))
+            store.db.executemany('INSERT INTO employee_shift_patterns(employee_id,weekday,shift_id) VALUES(?,?,?)',
+                                 [(eid, weekday, sid) for weekday, sid in selected_patterns])
         self.destroy()
         self.app.refresh_staff()
         self.app.update_demo_badge()
