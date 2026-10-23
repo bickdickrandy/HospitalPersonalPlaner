@@ -78,6 +78,25 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(any(c.rule == 'Feste Wochenschicht' and c.blocking for c in night))
         self.assertTrue(any(c.rule == 'Feste Wochenschicht' and c.blocking for c in early))
 
+    def test_fixed_weekday_shift_cannot_be_removed_or_taken_over_silently(self):
+        employee = self.store.db.execute(
+            "INSERT INTO employees(name,role,weekly_hours,max_days) VALUES('Festdienst','Pflege',38.5,5)"
+        ).lastrowid
+        partner = self.store.db.execute(
+            "INSERT INTO employees(name,role,weekly_hours,max_days) VALUES('Tauschpartner','Pflege',38.5,5)"
+        ).lastrowid
+        shifts = {r['name']: r['id'] for r in self.store.all('SELECT id,name FROM shifts')}
+        friday = date(2030, 1, 4)
+        self.store.run('INSERT INTO employee_shift_patterns(employee_id,weekday,shift_id) VALUES(?,?,?)',
+                       (employee, friday.weekday(), shifts['Nachtdienst']))
+        self.store.run('INSERT INTO assignments(day,employee_id,shift_id) VALUES(?,?,?)',
+                       (friday.isoformat(), employee, shifts['Nachtdienst']))
+        ctx = main.PlanContext(self.store, friday - timedelta(days=2), friday + timedelta(days=3))
+        preview = main.preview_day_changes(ctx, friday, {employee: None})
+        self.assertTrue(any(c.rule == 'Feste Wochenschicht' for c in preview[employee]))
+        takeover = main.evaluate_swap(ctx, 'takeover', employee, friday, partner)
+        self.assertTrue(any(c.rule == 'Feste Wochenschicht' for c in takeover.blockers))
+
     def test_month_generator_places_employee_weekday_pattern(self):
         employee = self.store.db.execute(
             "INSERT INTO employees(name,role,weekly_hours,max_days) VALUES('Regel Test','Pflege',38.5,5)"
