@@ -122,10 +122,15 @@ class SchedulerTests(unittest.TestCase):
         friday = date(2030, 1, 4)
         self.store.run('INSERT INTO assignments(day,employee_id,shift_id) VALUES(?,?,?)',
                        (friday.isoformat(), employee, shifts['Nachtdienst']))
+        saturday = friday + timedelta(days=1)
+        self.store.run('INSERT INTO assignments(day,employee_id,shift_id) VALUES(?,?,?)',
+                       (saturday.isoformat(), employee, shifts['Frühdienst']))
         ctx = main.PlanContext(self.store, friday - timedelta(days=2), friday + timedelta(days=3))
         checks = ctx.check_assignment(employee, friday + timedelta(days=1),
                                       shifts['Frühdienst'], include_ok=False)
         self.assertTrue(any(c.rule == 'Schichtfolge' and c.blocking for c in checks))
+        future_checks = ctx.check_assignment(employee, friday, shifts['Nachtdienst'], include_ok=False)
+        self.assertTrue(any(c.rule == 'Schichtfolge' and c.blocking for c in future_checks))
 
     def test_streak_limit_and_required_rest_days_are_enforced(self):
         employee = self.store.db.execute(
@@ -145,8 +150,11 @@ class SchedulerTests(unittest.TestCase):
                                      shifts['Spätdienst'], include_ok=False)
         rest = ctx.check_assignment(employee, monday + timedelta(days=5),
                                     shifts['Frühdienst'], include_ok=False)
+        after_rest = ctx.check_assignment(employee, monday + timedelta(days=6),
+                                          shifts['Frühdienst'], include_ok=False)
         self.assertTrue(any(c.rule == 'Schichtserie' and c.blocking for c in fifth))
         self.assertTrue(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in rest))
+        self.assertFalse(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in after_rest))
 
 
 if __name__ == '__main__':
