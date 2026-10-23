@@ -12,7 +12,7 @@ python main.py
 
 **Erster Start mit leerer Datenbank:** Es werden zehn fiktive **Demo-Personen** („Demo Alpha“ … „Demo Juliett“, markiert als *Testdaten*), drei Standardschichten (Früh 2–4, Spät 2–4, Nacht 1–2 Personen), gestaffelte **Testurlaube** im aktuellen und im Folgemonat und ein Beispielplan für den aktuellen Monat angelegt. Das passiert nur einmal und nur, wenn noch keine Mitarbeitenden existieren. Bestehende Pläne werden nie überschrieben.
 
-**Bestehende Datenbank:** Beim ersten Start nach dem Update wird die Datenbank automatisch migriert. Vorher wird eine Sicherung unter `data/backups/` angelegt. Die Migration ist wiederholbar (Schema-Version über `PRAGMA user_version`, aktuell 5) und ändert keine Plandaten. Personen, deren Name mit `Demo ` beginnt, werden als Testdaten gekennzeichnet.
+**Bestehende Datenbank:** Beim ersten Start nach dem Update wird die Datenbank automatisch migriert. Vorher wird eine Sicherung unter `data/backups/` angelegt. Die Migration ist wiederholbar (Schema-Version über `PRAGMA user_version`, aktuell 6) und ändert keine Plandaten. Personen, deren Name mit `Demo ` beginnt, werden als Testdaten gekennzeichnet.
 
 ## Funktionen
 
@@ -81,9 +81,13 @@ Eigene Seite mit Soll/Ist-Stunden, Differenz und Status (erfüllt / unter / übe
 
 ### Mitarbeitende, Schichten & Hausregeln
 - Mitarbeitende mit Bereich/Qualifikation, Wochenstunden, max. Arbeitstagen, Wünschen, einzelnen Abwesenheitstagen (per Datumsauswahl) und Schichteignung; aktivieren/deaktivieren.
+- **Feste Wochenschichten pro Person:** Im Mitarbeiterformular lassen sich Montag bis Sonntag jeweils einer festen Schicht zuordnen. Beispiel: Freitag → Nachtdienst (22:00–06:00); der Dienst wird am Freitag eingetragen und reicht bis Samstagmorgen. Der Generator plant diese Schicht automatisch ein und Prüfung/Tausch blockieren eine abweichende Schicht.
 - **Mitarbeitende löschen:** „Löschen“ zeigt vorher, wie viele zukünftige und vergangene Dienste sowie Urlaube mit entfernt werden. Gelöscht wird erst nach Bestätigung (bei echten Plandaten mit zweiter Rückfrage). Vorher legt die App automatisch eine Sicherung in `data/backups/` an. Wer Plandaten behalten will, nutzt „Aktiv / Inaktiv“.
 - Schichtmodelle mit Uhrzeiten, Stunden, Farbe, Mindest- und Maximalbesetzung (0 = unbegrenzt; bestehende Schichten erhalten bei der Migration Mindestbesetzung + 2). Schichten über Mitternacht (z. B. 22:00–06:00) werden korrekt bis in den Folgetag gerechnet.
 - Hausregeln: Mindestruhezeit (Standard 11 h), max. Arbeitstage am Stück (Standard 5), Bedenkzeit beim Klick-Tausch (Standard 5 s), Toleranz für Soll-Stunden (Standard ± 4 h) und ob Zusatzdienste geplant werden.
+- **Schichtfolgen:** Regeln wie „Nach Nachtdienst am Folgetag kein Frühdienst“ lassen sich für beliebige Schichten und 1–14 Folgetage konfigurieren.
+- **Schichtserien:** Pro Schicht lässt sich die maximale Anzahl direkt aufeinanderfolgender Dienste und die nötige Pause danach einstellen. Beispiel: höchstens 4 Spätdienste, danach 2 volle Ruhetage. Diese Regeln prüft die automatische Planung, Tagesbearbeitung und der Tauschassistent.
+- Bei den Standard-Schichten werden die Beispiele „Nachtdienst → kein Frühdienst am Folgetag“ und „höchstens 4 Spätdienste → 2 Ruhetage“ automatisch als anpassbare Regeln angelegt.
 - CSV-Export des Monats (Semikolon, UTF-8 mit BOM, Spalten wie bisher).
 
 ## Grenzen der Regelprüfung
