@@ -30,7 +30,7 @@ MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August'
 WEEKDAYS = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
 WEEKDAYS_LONG = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag']
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_SETTINGS = {
     # Hausregeln mit konservativen Standardwerten. Sie sind in der App änderbar und
     # ausdrücklich KEINE Aussage über gesetzliche Konformität.
@@ -214,7 +214,50 @@ def _migrate_to_v5(db):
                        (row[1], 'swap', row[2], json.dumps(changes), 0 if row[5] == 0 else 2))
 
 
-MIGRATIONS = {2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5}
+def _migrate_to_v6(db):
+    """Persönliche feste Wochenschichten und konfigurierbare Schichtfolgeregeln."""
+    db.executescript('''
+    CREATE TABLE IF NOT EXISTS employee_shift_patterns(
+        employee_id INTEGER NOT NULL, weekday INTEGER NOT NULL, shift_id INTEGER NOT NULL,
+        PRIMARY KEY(employee_id, weekday),
+        FOREIGN KEY(employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+        FOREIGN KEY(shift_id) REFERENCES shifts(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS shift_transition_rules(
+        id INTEGER PRIMARY KEY, after_shift_id INTEGER NOT NULL, blocked_shift_id INTEGER NOT NULL,
+        days_after INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(after_shift_id, blocked_shift_id),
+        FOREIGN KEY(after_shift_id) REFERENCES shifts(id) ON DELETE CASCADE,
+        FOREIGN KEY(blocked_shift_id) REFERENCES shifts(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS shift_streak_rules(
+        shift_id INTEGER PRIMARY KEY, max_consecutive INTEGER NOT NULL DEFAULT 4,
+        rest_days INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(shift_id) REFERENCES shifts(id) ON DELETE CASCADE);
+    ''')
+    _seed_default_shift_rules(db)
+
+
+def _seed_default_shift_rules(db):
+    """Legt die zwei gewünschten Beispielregeln bei Standard-Schichten einmalig an."""
+    seeded = db.execute("SELECT 1 FROM settings WHERE key='default_shift_rules_seeded'").fetchone()
+    if seeded:
+        return
+    names = {str(row['name']).strip().lower(): row['id'] for row in db.execute('SELECT id,name FROM shifts')}
+    night = next((names[n] for n in ('nachtdienst', 'nacht') if n in names), None)
+    early = next((names[n] for n in ('frühdienst', 'fruehdienst', 'früh', 'frueh') if n in names), None)
+    late = next((names[n] for n in ('spätdienst', 'spaetdienst', 'spät', 'spaet') if n in names), None)
+    if not any((night, early, late)):
+        return  # bei einer leeren Datenbank werden die Standardschichten erst nach der Migration angelegt
+    if night and early:
+        db.execute('INSERT OR IGNORE INTO shift_transition_rules(after_shift_id,blocked_shift_id,days_after) '
+                   'VALUES(?,?,1)', (night, early))
+    if late:
+        db.execute('INSERT OR IGNORE INTO shift_streak_rules(shift_id,max_consecutive,rest_days) VALUES(?,4,2)',
+                   (late,))
+    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('default_shift_rules_seeded','1')")
+
+
+MIGRATIONS = {2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5,
+              6: _migrate_to_v6}
 
 DEMO_STAFF = [
     # Fiktive Kennungen statt Namen – eindeutig als Testdaten erkennbar.
@@ -250,6 +293,8 @@ class Store:
             with self.db:
                 self.db.executemany('INSERT INTO shifts(name,start,end,hours,color,coverage,max_staff) '
                                     'VALUES(?,?,?,?,?,?,?)', DEFAULT_SHIFTS)
+        with self.db:
+            _seed_default_shift_rules(self.db)
         self.demo_seeded_now = self.seed_demo_staff()
 
     # -- Migrationen -------------------------------------------------------
@@ -476,6 +521,12 @@ class PlanContext:
         self.elig = {eid: set() for eid in self.employees}
         for r in store.all('SELECT employee_id,shift_id FROM eligibility'):
             self.elig.setdefault(r['employee_id'], set()).add(r['shift_id'])
+        self.patterns = {(r['employee_id'], int(r['weekday'])): r['shift_id']
+                         for r in store.all('SELECT employee_id,weekday,shift_id FROM employee_shift_patterns')}
+        self.transition_rules = [dict(r) for r in store.all(
+            'SELECT after_shift_id,blocked_shift_id,days_after FROM shift_transition_rules')]
+        self.streak_rules = {r['shift_id']: (int(r['max_consecutive']), int(r['rest_days']))
+                             for r in store.all('SELECT shift_id,max_consecutive,rest_days FROM shift_streak_rules')}
         self.plan = {}
         for r in store.all('SELECT day,employee_id,shift_id FROM assignments WHERE day BETWEEN ? AND ? '
                            'AND shift_id IS NOT NULL', (self.lo.isoformat(), self.hi.isoformat())):
@@ -572,6 +623,13 @@ class PlanContext:
 
         add('Schichteignung', self.eligible(eid, sid), f'{emp.name} ist für {shift.name} eingetragen.',
             f'{emp.name} ist nicht für {shift.name} als einsetzbar eingetragen.')
+        fixed_sid = self.patterns.get((eid, day.weekday()))
+        if fixed_sid:
+            fixed = self.shifts.get(fixed_sid)
+            add('Feste Wochenschicht', fixed_sid == sid,
+                f'{emp.name} hat {shift.name} als feste Wochenschicht eingetragen.',
+                f'{emp.name} hat an diesem Wochentag fest {fixed.name if fixed else "eine andere Schicht"} '
+                f'eingetragen, nicht {shift.name}.')
         add('Urlaub', not self.on_leave(eid, day), f'Kein Urlaub am {fmt_day(day)}.',
             f'{emp.name} hat am {fmt_day(day)} Urlaub.')
         add('Abwesenheit', not self.absent(eid, day), f'Kein Abwesenheitstag am {fmt_day(day)}.',
@@ -624,11 +682,73 @@ class PlanContext:
 
         if is_weekend(day) and emp.avoids_weekend:
             checks.append(Check('Wunsch', 'warn', f'{emp.name} möchte Wochenenden vermeiden.'))
+        checks.extend(self._configured_shift_checks(eid, day, ov))
         return checks
 
     def _rest_msg(self, emp, first, first_day, second, second_day, gap):
         return (f'{emp.name}: nur {fmt_hours(max(gap, 0))} h Ruhe zwischen {first.name} ({fmt_day(first_day)}) '
                 f'und {second.name} ({fmt_day(second_day)}), Hausregel {fmt_hours(self.min_rest_hours)} h.')
+
+    def _configured_shift_checks(self, eid, day, overlay):
+        """Prüft Regeln zu Schichtfolgen und Serien für den hypothetischen Plan."""
+        emp = self.employees[eid]
+        checks = []
+        assigned = {}
+        for (person, iso), shift_id in self.plan.items():
+            if person == eid and shift_id:
+                assigned[date.fromisoformat(iso)] = shift_id
+        for (person, iso), shift_id in overlay.items():
+            if person == eid:
+                target = date.fromisoformat(iso)
+                if shift_id:
+                    assigned[target] = shift_id
+                else:
+                    assigned.pop(target, None)
+
+        for rule in self.transition_rules:
+            after_sid = rule['after_shift_id']
+            blocked_sid = rule['blocked_shift_id']
+            days_after = int(rule['days_after'])
+            if after_sid not in self.shifts or blocked_sid not in self.shifts:
+                continue
+            for offset in range(1, days_after + 1):
+                previous = day - timedelta(days=offset)
+                following = day + timedelta(days=offset)
+                if assigned.get(previous) == after_sid and assigned.get(day) == blocked_sid:
+                    checks.append(Check('Schichtfolge', 'block',
+                                        f'{emp.name}: {self.shifts[blocked_sid].name} ist innerhalb von '
+                                        f'{days_after} Tag(en) nach {self.shifts[after_sid].name} gesperrt.'))
+                    break
+                if assigned.get(day) == after_sid and assigned.get(following) == blocked_sid:
+                    checks.append(Check('Schichtfolge', 'block',
+                                        f'{emp.name}: nach {self.shifts[after_sid].name} darf innerhalb von '
+                                        f'{days_after} Tag(en) kein {self.shifts[blocked_sid].name} folgen.'))
+                    break
+
+        for streak_sid, (maximum, rest_days) in self.streak_rules.items():
+            if streak_sid not in self.shifts or maximum < 1:
+                continue
+            dates = sorted(d for d, value in assigned.items() if value == streak_sid)
+            runs = []
+            for current in dates:
+                if not runs or current != runs[-1][-1] + timedelta(days=1):
+                    runs.append([current])
+                else:
+                    runs[-1].append(current)
+            for run in runs:
+                if len(run) > maximum and day in run:
+                    checks.append(Check('Schichtserie', 'block',
+                                        f'{emp.name}: maximal {maximum} aufeinanderfolgende Dienste '
+                                        f'„{self.shifts[streak_sid].name}“ erlaubt.'))
+                    break
+                if len(run) >= maximum and rest_days:
+                    rest = {run[-1] + timedelta(days=n) for n in range(1, rest_days + 1)}
+                    if day in rest and assigned.get(day):
+                        checks.append(Check('Ruhetage nach Schichtserie', 'block',
+                                            f'{emp.name}: nach {maximum} aufeinanderfolgenden Diensten '
+                                            f'„{self.shifts[streak_sid].name}“ sind {rest_days} volle Ruhetage nötig.'))
+                        break
+        return checks
 
     def coverage_checks(self, pairs, overlay):
         checks = []
@@ -1113,6 +1233,16 @@ def _draft_month(store, month, clear_existing, rng, fill_hours):
     if clear_existing:
         for key in [k for k in ctx.plan if lo <= k[1] <= hi]:
             del ctx.plan[key]
+    pattern_inserts = []
+    for day in daterange(start, end):
+        for e in ctx.active:
+            sid = ctx.patterns.get((e.id, day.weekday()))
+            if not sid or (e.id, day.isoformat()) in ctx.plan:
+                continue
+            blockers = [c for c in ctx.check_assignment(e.id, day, sid, include_ok=False) if c.blocking]
+            if not blockers:
+                ctx.plan[(e.id, day.isoformat())] = sid
+                pattern_inserts.append((day.isoformat(), e.id, sid))
     active_ids = {e.id for e in ctx.active}
     targets = {e.id: ctx.target_hours(e.id) for e in ctx.active}
     hours = {e.id: ctx.month_hours(e.id) for e in ctx.active}
@@ -1131,7 +1261,7 @@ def _draft_month(store, month, clear_existing, rng, fill_hours):
     fair_special = _fair_shares(ctx, special_total, ctx.active)
     night_pool = [e for e in ctx.active if any(ctx.eligible(e.id, sid) for sid in night_ids)]
     fair_night = _fair_shares(ctx, night_total, night_pool)
-    inserts = []
+    inserts = list(pattern_inserts)
 
     def fairness_cost(e, day, shift):
         cost = 0.0
