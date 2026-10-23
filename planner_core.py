@@ -30,7 +30,7 @@ MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August'
 WEEKDAYS = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
 WEEKDAYS_LONG = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag']
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_SETTINGS = {
     # Hausregeln mit konservativen Standardwerten. Sie sind in der App änderbar und
     # ausdrücklich KEINE Aussage über gesetzliche Konformität.
@@ -236,6 +236,12 @@ def _migrate_to_v6(db):
     _seed_default_shift_rules(db)
 
 
+def _migrate_to_v7(db):
+    """Erlaubt Ruhetage nach jeder Schichtserie, auch wenn sie kürzer als das Maximum ist."""
+    if 'rest_after_any_run' not in _columns(db, 'shift_streak_rules'):
+        db.execute('ALTER TABLE shift_streak_rules ADD COLUMN rest_after_any_run INTEGER NOT NULL DEFAULT 0')
+
+
 def _seed_default_shift_rules(db):
     """Legt die zwei gewünschten Beispielregeln bei Standard-Schichten einmalig an."""
     seeded = db.execute("SELECT 1 FROM settings WHERE key='default_shift_rules_seeded'").fetchone()
@@ -257,7 +263,7 @@ def _seed_default_shift_rules(db):
 
 
 MIGRATIONS = {2: _migrate_to_v2, 3: _migrate_to_v3, 4: _migrate_to_v4, 5: _migrate_to_v5,
-              6: _migrate_to_v6}
+              6: _migrate_to_v6, 7: _migrate_to_v7}
 
 DEMO_STAFF = [
     # Fiktive Kennungen statt Namen – eindeutig als Testdaten erkennbar.
@@ -525,8 +531,10 @@ class PlanContext:
                          for r in store.all('SELECT employee_id,weekday,shift_id FROM employee_shift_patterns')}
         self.transition_rules = [dict(r) for r in store.all(
             'SELECT after_shift_id,blocked_shift_id,days_after FROM shift_transition_rules')]
-        self.streak_rules = {r['shift_id']: (int(r['max_consecutive']), int(r['rest_days']))
-                             for r in store.all('SELECT shift_id,max_consecutive,rest_days FROM shift_streak_rules')}
+        self.streak_rules = {r['shift_id']: (int(r['max_consecutive']), int(r['rest_days']),
+                                              bool(r['rest_after_any_run']))
+                             for r in store.all('''SELECT shift_id,max_consecutive,rest_days,rest_after_any_run
+                                 FROM shift_streak_rules''')}
         self.plan = {}
         for r in store.all('SELECT day,employee_id,shift_id FROM assignments WHERE day BETWEEN ? AND ? '
                            'AND shift_id IS NOT NULL', (self.lo.isoformat(), self.hi.isoformat())):
@@ -720,7 +728,7 @@ class PlanContext:
                                         f'{days_after} Tag(en) kein {self.shifts[blocked_sid].name} folgen.'))
                     break
 
-        for streak_sid, (maximum, rest_days) in self.streak_rules.items():
+        for streak_sid, (maximum, rest_days, rest_after_any_run) in self.streak_rules.items():
             if streak_sid not in self.shifts or maximum < 1:
                 continue
             # Nur die zusammenhängende Serie am zu prüfenden Tag kann durch die
@@ -740,24 +748,30 @@ class PlanContext:
                                         f'{emp.name}: maximal {maximum} aufeinanderfolgende Dienste '
                                         f'„{self.shifts[streak_sid].name}“ erlaubt.'))
 
-            # Für einen Ruhetag reicht es, mögliche Serienenden innerhalb des
-            # erlaubten Pausenfensters rückwärts zu prüfen.
+            # Ruhetage lassen sich am Serienende prüfen. Optional gilt die Pause
+            # nach jeder Serie, auch wenn sie kürzer als die Maximalfolge war.
             if rest_days and assigned(day):
                 violates_rest = False
                 for offset in range(1, rest_days + 1):
                     cursor = day - timedelta(days=offset)
                     if assigned(cursor) != streak_sid:
                         continue
-                    run_length = 0
-                    while assigned(cursor) == streak_sid:
-                        run_length += 1
-                        cursor -= timedelta(days=1)
-                    if run_length >= maximum:
+                    # Ein Serienende liegt vor, wenn am Folgetag die Schichtserie
+                    # nicht mit derselben Schicht fortgesetzt wird.
+                    if rest_after_any_run and assigned(cursor + timedelta(days=1)) != streak_sid:
                         violates_rest = True
                         break
+                    if not rest_after_any_run:
+                        run_length = 0
+                        while assigned(cursor) == streak_sid:
+                            run_length += 1
+                            cursor -= timedelta(days=1)
+                        if run_length >= maximum:
+                            violates_rest = True
+                            break
                 if violates_rest:
                     checks.append(Check('Ruhetage nach Schichtserie', 'block',
-                                        f'{emp.name}: nach {maximum} aufeinanderfolgenden Diensten '
+                                        f'{emp.name}: nach der Schichtserie '
                                         f'„{self.shifts[streak_sid].name}“ sind {rest_days} volle Ruhetage nötig.'))
         return checks
 
