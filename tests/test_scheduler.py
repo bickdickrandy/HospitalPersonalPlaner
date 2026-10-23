@@ -51,7 +51,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_schema_v6_migrates_existing_database_without_losing_employees(self):
         employee = self.store.db.execute('SELECT id FROM employees LIMIT 1').fetchone()[0]
-        self.assertEqual(self.store.schema_version(), 6)
+        self.assertEqual(self.store.schema_version(), 7)
         self.assertEqual(self.store.db.execute('SELECT id FROM employees WHERE id=?', (employee,)).fetchone()[0],
                          employee)
         self.assertIsNotNone(self.store.db.execute(
@@ -63,6 +63,9 @@ class SchedulerTests(unittest.TestCase):
         streak = self.store.db.execute('SELECT max_consecutive,rest_days FROM shift_streak_rules WHERE shift_id=?',
                                        (shifts['Spätdienst'],)).fetchone()
         self.assertEqual(tuple(streak), (4, 2))
+        self.assertEqual(self.store.db.execute(
+            'SELECT rest_after_any_run FROM shift_streak_rules WHERE shift_id=?',
+            (shifts['Spätdienst'],)).fetchone()[0], 0)
 
     def test_fixed_weekday_shift_is_blocking_for_other_shifts(self):
         employee = self.store.db.execute(
@@ -155,6 +158,44 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(any(c.rule == 'Schichtserie' and c.blocking for c in fifth))
         self.assertTrue(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in rest))
         self.assertFalse(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in after_rest))
+
+    def test_rest_days_apply_after_short_or_long_night_series(self):
+        employee = self.store.db.execute(
+            "INSERT INTO employees(name,role,weekly_hours,max_days) VALUES('Nachtserie', 'Pflege', 38.5, 7)"
+        ).lastrowid
+        shifts = {r['name']: r['id'] for r in self.store.all('SELECT id,name FROM shifts')}
+        night_id, early_id = shifts['Nachtdienst'], shifts['Frühdienst']
+        self.store.run('''INSERT INTO shift_streak_rules
+            (shift_id,max_consecutive,rest_days,rest_after_any_run) VALUES(?,?,?,1)
+            ON CONFLICT(shift_id) DO UPDATE SET max_consecutive=excluded.max_consecutive,
+            rest_days=excluded.rest_days,rest_after_any_run=excluded.rest_after_any_run''', (night_id, 4, 2))
+        monday = date(2030, 1, 7)
+
+        for length in (1, 2, 3, 4):
+            with self.store.db:
+                self.store.db.execute('DELETE FROM assignments WHERE employee_id=?', (employee,))
+                self.store.db.executemany(
+                    'INSERT INTO assignments(day,employee_id,shift_id) VALUES(?,?,?)',
+                    [((monday + timedelta(days=n)).isoformat(), employee, night_id) for n in range(length)])
+
+            last_night = monday + timedelta(days=length - 1)
+            first_rest = last_night + timedelta(days=1)
+            ctx = main.PlanContext(self.store, monday - timedelta(days=2), monday + timedelta(days=12))
+            for rest_day in (first_rest, first_rest + timedelta(days=1)):
+                checks = ctx.check_assignment(employee, rest_day, early_id, include_ok=False)
+                self.assertTrue(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in checks),
+                                f'{length} Nachtdienst(e): {rest_day} muss frei bleiben')
+
+            after_pause = ctx.check_assignment(employee, first_rest + timedelta(days=2), early_id,
+                                               include_ok=False)
+            self.assertFalse(any(c.rule == 'Ruhetage nach Schichtserie' and c.blocking for c in after_pause),
+                             f'{length} Nachtdienst(e): nach zwei freien Tagen darf wieder gearbeitet werden')
+
+            if length < 4:
+                continuation = ctx.check_assignment(employee, first_rest, night_id, include_ok=False)
+                self.assertFalse(any(c.rule in ('Schichtserie', 'Ruhetage nach Schichtserie') and c.blocking
+                                     for c in continuation),
+                                 f'{length} Nachtdienst(e): die Nachtdienst-Serie darf weiterlaufen')
 
 
 if __name__ == '__main__':
