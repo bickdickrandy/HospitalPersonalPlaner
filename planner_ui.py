@@ -641,9 +641,6 @@ class App(tk.Tk):
         self.store = store or core.Store()
         self.month = date.today().replace(day=1)
         self.last_generation = None
-        if self.store.demo_seeded_now and not self.store.all('SELECT id FROM assignments LIMIT 1'):
-            # Beispielmonat nur für eine frisch angelegte Demo-Datenbank – bestehende Pläne bleiben unberührt.
-            self.last_generation = (self.month, core.generate_month(self.store, self.month))
         self.ctx = None
         self.role_filter, self.shift_filter = None, None
         self.selected = None
@@ -684,8 +681,8 @@ class App(tk.Tk):
         if self.store.backup_path:
             self.set_status(f'Datenbank wurde aktualisiert. Sicherung vor der Migration: '
                             f'{os.path.basename(self.store.backup_path)} (Ordner data/backups)')
-        elif self.last_generation:
-            self.set_status('Demo-Datenbank angelegt: fiktive Testpersonen und ein Beispielmonat wurden erzeugt.')
+        elif self.store.demo_seeded_now:
+            self.set_status('Demo-Datenbank angelegt: fiktive Testpersonen sind bereit. Plane den Monat bei Bedarf selbst.')
 
     def on_close(self):
         self._stop_pending()  # ein noch laufender Klick-Tausch wird NICHT gespeichert
@@ -808,6 +805,7 @@ class App(tk.Tk):
         right = tk.Frame(top, bg=C.BG)
         right.pack(side='right', anchor='s')
         ttk.Button(right, text='⚙  Monat planen', style='Accent.TButton', command=self.generate).pack(side='right')
+        ttk.Button(right, text='↻  Neu laden', command=self.reload_plan).pack(side='right', padx=(0, 8))
         ttk.Button(right, text='CSV', command=self.export_csv).pack(side='right', padx=8)
         self.side_btn = ttk.Button(right, text='◧  Übersicht', command=self.toggle_side)
         self.side_btn.pack(side='right', padx=(8, 0))
@@ -1003,6 +1001,14 @@ class App(tk.Tk):
             self._compute_swap()
         self.cal.render()
         self.render_side()
+
+    def reload_plan(self):
+        """Lädt Mitarbeiter, Dienste und Urlaub des sichtbaren Zeitraums erneut aus SQLite."""
+        if self.busy:
+            return
+        self.cancel_swap(render=False)
+        self.refresh_plan()
+        self.set_status(f'Dienstplan für {MONTHS[self.month.month - 1]} {self.month.year} neu geladen.')
 
     # -- Tauschassistent ---------------------------------------------------
     def chip_clicked(self, eid, day):
