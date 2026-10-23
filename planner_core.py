@@ -617,23 +617,23 @@ class PlanContext:
         def add(rule, ok, message_ok, message_fail, status_fail='block'):
             if ok:
                 if include_ok:
-                    checks.append(Check(rule, 'ok', message_ok))
+                    checks.append(Check(rule, 'ok', message_ok() if callable(message_ok) else message_ok))
             else:
-                checks.append(Check(rule, status_fail, message_fail))
+                checks.append(Check(rule, status_fail, message_fail() if callable(message_fail) else message_fail))
 
-        add('Schichteignung', self.eligible(eid, sid), f'{emp.name} ist für {shift.name} eingetragen.',
-            f'{emp.name} ist nicht für {shift.name} als einsetzbar eingetragen.')
+        add('Schichteignung', self.eligible(eid, sid), lambda: f'{emp.name} ist für {shift.name} eingetragen.',
+            lambda: f'{emp.name} ist nicht für {shift.name} als einsetzbar eingetragen.')
         fixed_sid = self.patterns.get((eid, day.weekday()))
         if fixed_sid:
             fixed = self.shifts.get(fixed_sid)
             add('Feste Wochenschicht', fixed_sid == sid,
-                f'{emp.name} hat {shift.name} als feste Wochenschicht eingetragen.',
-                f'{emp.name} hat an diesem Wochentag fest {fixed.name if fixed else "eine andere Schicht"} '
+                lambda: f'{emp.name} hat {shift.name} als feste Wochenschicht eingetragen.',
+                lambda: f'{emp.name} hat an diesem Wochentag fest {fixed.name if fixed else "eine andere Schicht"} '
                 f'eingetragen, nicht {shift.name}.')
-        add('Urlaub', not self.on_leave(eid, day), f'Kein Urlaub am {fmt_day(day)}.',
-            f'{emp.name} hat am {fmt_day(day)} Urlaub.')
-        add('Abwesenheit', not self.absent(eid, day), f'Kein Abwesenheitstag am {fmt_day(day)}.',
-            f'{emp.name} ist am {fmt_day(day)} als abwesend eingetragen.')
+        add('Urlaub', not self.on_leave(eid, day), lambda: f'Kein Urlaub am {fmt_day(day)}.',
+            lambda: f'{emp.name} hat am {fmt_day(day)} Urlaub.')
+        add('Abwesenheit', not self.absent(eid, day), lambda: f'Kein Abwesenheitstag am {fmt_day(day)}.',
+            lambda: f'{emp.name} ist am {fmt_day(day)} als abwesend eingetragen.')
         if not emp.active:
             checks.append(Check('Status', 'block', f'{emp.name} ist deaktiviert.'))
 
@@ -642,8 +642,8 @@ class PlanContext:
         worked = sum(1 for n in range(7) if self.shift_of(eid, week_start + timedelta(days=n), ov))
         limit = emp.max_days or 7
         kw = day.isocalendar()[1]
-        add('Max. Arbeitstage', worked <= limit, f'KW {kw}: {worked} von max. {limit} Tagen.',
-            f'{emp.name}: KW {kw} hätte {worked} Arbeitstage, erlaubt sind {limit}.')
+        add('Max. Arbeitstage', worked <= limit, lambda: f'KW {kw}: {worked} von max. {limit} Tagen.',
+            lambda: f'{emp.name}: KW {kw} hätte {worked} Arbeitstage, erlaubt sind {limit}.')
 
         # Aufeinanderfolgende Arbeitstage
         if self.max_consecutive > 0:
@@ -654,8 +654,8 @@ class PlanContext:
                 last += timedelta(days=1)
             run = (last - first).days + 1
             add('Folgetage', run <= self.max_consecutive,
-                f'{run} Arbeitstag(e) am Stück (Grenze {self.max_consecutive}).',
-                f'{emp.name}: {run} Arbeitstage am Stück ({fmt_day(first)}–{fmt_day(last)}), '
+                lambda: f'{run} Arbeitstag(e) am Stück (Grenze {self.max_consecutive}).',
+                lambda: f'{emp.name}: {run} Arbeitstage am Stück ({fmt_day(first)}–{fmt_day(last)}), '
                 f'Hausregel max. {self.max_consecutive}.')
 
         # Ruhezeit zwischen Schichten (Hausregel, generisch über Uhrzeiten)
@@ -693,17 +693,12 @@ class PlanContext:
         """Prüft Regeln zu Schichtfolgen und Serien für den hypothetischen Plan."""
         emp = self.employees[eid]
         checks = []
-        assigned = {}
-        for (person, iso), shift_id in self.plan.items():
-            if person == eid and shift_id:
-                assigned[date.fromisoformat(iso)] = shift_id
-        for (person, iso), shift_id in overlay.items():
-            if person == eid:
-                target = date.fromisoformat(iso)
-                if shift_id:
-                    assigned[target] = shift_id
-                else:
-                    assigned.pop(target, None)
+
+        # Regelprüfungen laufen im Generator für jeden möglichen Mitarbeiter-/Schicht-Kandidaten.
+        # Den kompletten Monatsplan hier jedes Mal zu kopieren und zu sortieren war dadurch
+        # quadratisch teuer. `shift_of` greift direkt auf den Plan zu und berücksichtigt Overlays.
+        def assigned(target):
+            return self.shift_of(eid, target, overlay)
 
         for rule in self.transition_rules:
             after_sid = rule['after_shift_id']
@@ -714,12 +709,12 @@ class PlanContext:
             for offset in range(1, days_after + 1):
                 previous = day - timedelta(days=offset)
                 following = day + timedelta(days=offset)
-                if assigned.get(previous) == after_sid and assigned.get(day) == blocked_sid:
+                if assigned(previous) == after_sid and assigned(day) == blocked_sid:
                     checks.append(Check('Schichtfolge', 'block',
                                         f'{emp.name}: {self.shifts[blocked_sid].name} ist innerhalb von '
                                         f'{days_after} Tag(en) nach {self.shifts[after_sid].name} gesperrt.'))
                     break
-                if assigned.get(day) == after_sid and assigned.get(following) == blocked_sid:
+                if assigned(day) == after_sid and assigned(following) == blocked_sid:
                     checks.append(Check('Schichtfolge', 'block',
                                         f'{emp.name}: nach {self.shifts[after_sid].name} darf innerhalb von '
                                         f'{days_after} Tag(en) kein {self.shifts[blocked_sid].name} folgen.'))
@@ -728,26 +723,42 @@ class PlanContext:
         for streak_sid, (maximum, rest_days) in self.streak_rules.items():
             if streak_sid not in self.shifts or maximum < 1:
                 continue
-            dates = sorted(d for d, value in assigned.items() if value == streak_sid)
-            runs = []
-            for current in dates:
-                if not runs or current != runs[-1][-1] + timedelta(days=1):
-                    runs.append([current])
-                else:
-                    runs[-1].append(current)
-            for run in runs:
-                if len(run) > maximum and day in run:
+            # Nur die zusammenhängende Serie am zu prüfenden Tag kann durch die
+            # hypothetische Zuweisung länger werden.
+            if assigned(day) == streak_sid:
+                run_length = 1
+                cursor = day - timedelta(days=1)
+                while assigned(cursor) == streak_sid:
+                    run_length += 1
+                    cursor -= timedelta(days=1)
+                cursor = day + timedelta(days=1)
+                while assigned(cursor) == streak_sid:
+                    run_length += 1
+                    cursor += timedelta(days=1)
+                if run_length > maximum:
                     checks.append(Check('Schichtserie', 'block',
                                         f'{emp.name}: maximal {maximum} aufeinanderfolgende Dienste '
                                         f'„{self.shifts[streak_sid].name}“ erlaubt.'))
-                    break
-                if len(run) >= maximum and rest_days:
-                    rest = {run[-1] + timedelta(days=n) for n in range(1, rest_days + 1)}
-                    if day in rest and assigned.get(day):
-                        checks.append(Check('Ruhetage nach Schichtserie', 'block',
-                                            f'{emp.name}: nach {maximum} aufeinanderfolgenden Diensten '
-                                            f'„{self.shifts[streak_sid].name}“ sind {rest_days} volle Ruhetage nötig.'))
+
+            # Für einen Ruhetag reicht es, mögliche Serienenden innerhalb des
+            # erlaubten Pausenfensters rückwärts zu prüfen.
+            if rest_days and assigned(day):
+                violates_rest = False
+                for offset in range(1, rest_days + 1):
+                    cursor = day - timedelta(days=offset)
+                    if assigned(cursor) != streak_sid:
+                        continue
+                    run_length = 0
+                    while assigned(cursor) == streak_sid:
+                        run_length += 1
+                        cursor -= timedelta(days=1)
+                    if run_length >= maximum:
+                        violates_rest = True
                         break
+                if violates_rest:
+                    checks.append(Check('Ruhetage nach Schichtserie', 'block',
+                                        f'{emp.name}: nach {maximum} aufeinanderfolgenden Diensten '
+                                        f'„{self.shifts[streak_sid].name}“ sind {rest_days} volle Ruhetage nötig.'))
         return checks
 
     def coverage_checks(self, pairs, overlay):
